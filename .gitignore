@@ -1,0 +1,31 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude / AI
+.claude/
+CLAUDE.md
+PLAN.md
+*.plan
+
+# Compiled
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes

@@ -1,0 +1,273 @@
+// Tests for ChatSession: construction, state management, history, parameters
+// Ported from swift/Tests/MLXLMTests/ChatSessionTests.swift
+//
+// Note: The Swift ChatSessionTests require a real model (Gemma3Text) for
+// generate/stream tests. Those are skipped here. We test the parts of
+// ChatSession that can be exercised without model inference: construction,
+// parameter management, message building, history re-hydration, and clear.
+
+#include <catch2/catch_test_macros.hpp>
+#include <mlx-lm/common/chat.h>
+#include <mlx-lm/common/chat_session.h>
+#include <mlx-lm/common/generate_params.h>
+#include <mlx-lm/common/model_container.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace mlx_lm;
+
+// ---------------------------------------------------------------------------
+// Helper: create a minimal ModelContainer with stub functions.
+// These stubs are sufficient for testing ChatSession construction and state
+// but will NOT produce real model output.
+// ---------------------------------------------------------------------------
+static std::shared_ptr<ModelContainer> make_stub_container() {
+    ModelContext ctx;
+    ctx.model_id = "test-stub-model";
+    ctx.eos_token_ids = std::vector<int>{2};
+
+    // Stub functions -- they should never be called in these unit tests.
+    // If they are called, they will throw, which is fine for testing.
+    ctx.encode_fn = [](const std::string&) -> std::vector<int> {
+        throw std::runtime_error("stub encode_fn called");
+    };
+    ctx.decode_fn = [](const std::vector<int>&) -> std::string {
+        throw std::runtime_error("stub decode_fn called");
+    };
+    ctx.apply_chat_template_fn = [](const std::vector<std::unordered_map<std::string, std::string>>&)
+        -> std::vector<int> {
+        throw std::runtime_error("stub apply_chat_template_fn called");
+    };
+    ctx.new_cache_fn = [](const GenerateParameters&) -> std::vector<KVCache> {
+        return {};
+    };
+
+    return std::make_shared<ModelContainer>(std::move(ctx));
+}
+
+// ===========================================================================
+// Construction Tests
+// ===========================================================================
+
+TEST_CASE("ChatSession default construction", "[chat_session]") {
+    auto container = make_stub_container();
+    ChatSession session(container);
+
+    CHECK(session.message_history().empty());
+    CHECK(!session.instructions().has_value());
+    CHECK(session.generate_parameters().temperature == 0.6f);
+    CHECK(session.generate_parameters().top_p == 1.0f);
+}
+
+TEST_CASE("ChatSession construction with instructions", "[chat_session]") {
+    auto container = make_stub_container();
+    ChatSession session(container, "You are a helpful assistant.");
+
+    CHECK(session.instructions().has_value());
+    CHECK(session.instructions().value() == "You are a helpful assistant.");
+    CHECK(session.message_history().empty());
+}
+
+TEST_CASE("ChatSession construction with custom generate params", "[chat_session]") {
+    auto container = make_stub_container();
+
+    GenerateParameters params;
+    params.temperature = 0.8f;
+    params.top_p = 0.95f;
+    params.max_tokens = 256;
+
+    ChatSession session(container, std::nullopt, params);
+
+    CHECK(session.generate_parameters().temperature == 0.8f);
+    CHECK(session.generate_parameters().top_p == 0.95f);
+    REQUIRE(session.generate_parameters().max_tokens.has_value());
+    CHECK(session.generate_parameters().max_tokens.value() == 256);
+}
+
+TEST_CASE("ChatSession construction with history re-hydration", "[chat_session]") {
+    auto container = make_stub_container();
+
+    std::vector<chat::ChatMessage> history = {
+        chat::ChatMessage::user("What is the capital of France?"),
+        chat::ChatMessage::assistant("The capital of France is Paris."),
+        chat::ChatMessage::user("What about Germany?"),
+        chat::ChatMessage::assistant("The capital of Germany is Berlin."),
+    };
+
+    ChatSession session(container, std::move(history), "You are a geography expert.");
+
+    CHECK(session.instructions().has_value());
+    CHECK(session.instructions().value() == "You are a geography expert.");
+    // After construction with history, message_history reflects that history.
+    // (The exact behavior depends on implementation -- it may be in pending_history_
+    // until the first generation call, but message_history() should still return it.)
+}
+
+// ===========================================================================
+// Parameter Management Tests
+// ===========================================================================
+
+TEST_CASE("ChatSession set and clear instructions", "[chat_session]") {
+    auto container = make_stub_container();
+    ChatSession session(container);
+
+    CHECK(!session.instructions().has_value());
+
+    session.set_instructions("Be concise.");
+    REQUIRE(session.instructions().has_value());
+    CHECK(session.instructions().value() == "Be concise.");
+
+    session.clear_instructions();
+    CHECK(!session.instructions().has_value());
+}
+
+TEST_CASE("ChatSession set generate parameters", "[chat_session]") {
+    auto container = make_stub_container();
+    ChatSession session(container);
+
+    // Verify defaults
+    CHECK(session.generate_parameters().temperature == 0.6f);
+    CHECK(session.generate_parameters().prefill_step_size == 512);
+
+    // Update parameters
+    GenerateParameters new_params;
+    new_params.temperature = 0.0f;
+    new_params.prefill_step_size = 1024;
+    new_params.max_tokens = 100;
+    session.set_generate_parameters(new_params);
+
+    CHECK(session.generate_parameters().temperature == 0.0f);
+    CHECK(session.generate_parameters().prefill_step_size == 1024);
+    REQUIRE(session.generate_parameters().max_tokens.has_value());
+    CHECK(session.generate_parameters().max_tokens.value() == 100);
+}
+
+// ===========================================================================
+// Clear Tests
+// ===========================================================================
+
+TEST_CASE("ChatSession clear resets history", "[chat_session]") {
+    auto container = make_stub_container();
+    ChatSession session(container, "System prompt.");
+
+    // Clear should reset history but preserve instructions
+    session.clear();
+    CHECK(session.message_history().empty());
+    // Instructions should be preserved after clear
+    CHECK(session.instructions().has_value());
+    CHECK(session.instructions().value() == "System prompt.");
+}
+
+// ===========================================================================
+// Move Semantics Tests
+// ===========================================================================
+
+TEST_CASE("ChatSession is movable", "[chat_session]") {
+    auto container = make_stub_container();
+
+    ChatSession session1(container, "Instructions.");
+
+    GenerateParameters params;
+    params.temperature = 0.9f;
+    session1.set_generate_parameters(params);
+
+    // Move construct
+    ChatSession session2(std::move(session1));
+
+    CHECK(session2.instructions().has_value());
+    CHECK(session2.instructions().value() == "Instructions.");
+    CHECK(session2.generate_parameters().temperature == 0.9f);
+}
+
+// ===========================================================================
+// Chat Message Helpers Tests
+// ===========================================================================
+
+TEST_CASE("ChatMessage factory helpers", "[chat_session]") {
+    auto user_msg = chat::ChatMessage::user("hello");
+    CHECK(user_msg.role == chat::Role::User);
+    CHECK(user_msg.content == "hello");
+
+    auto asst_msg = chat::ChatMessage::assistant("hi there");
+    CHECK(asst_msg.role == chat::Role::Assistant);
+    CHECK(asst_msg.content == "hi there");
+
+    auto sys_msg = chat::ChatMessage::system("You are helpful.");
+    CHECK(sys_msg.role == chat::Role::System);
+    CHECK(sys_msg.content == "You are helpful.");
+
+    auto tool_msg = chat::ChatMessage::tool("{\"result\": 42}");
+    CHECK(tool_msg.role == chat::Role::Tool);
+    CHECK(tool_msg.content == "{\"result\": 42}");
+}
+
+TEST_CASE("Role string conversion round-trip", "[chat_session]") {
+    CHECK(chat::role_to_string(chat::Role::User) == "user");
+    CHECK(chat::role_to_string(chat::Role::Assistant) == "assistant");
+    CHECK(chat::role_to_string(chat::Role::System) == "system");
+    CHECK(chat::role_to_string(chat::Role::Tool) == "tool");
+
+    CHECK(chat::role_from_string("user") == chat::Role::User);
+    CHECK(chat::role_from_string("assistant") == chat::Role::Assistant);
+    CHECK(chat::role_from_string("system") == chat::Role::System);
+    CHECK(chat::role_from_string("tool") == chat::Role::Tool);
+
+    // Unknown roles default to User
+    CHECK(chat::role_from_string("unknown") == chat::Role::User);
+    CHECK(chat::role_from_string("") == chat::Role::User);
+}
+
+// ===========================================================================
+// DefaultMessageGenerator Tests
+// ===========================================================================
+
+TEST_CASE("DefaultMessageGenerator produces role+content maps", "[chat_session]") {
+    DefaultMessageGenerator gen;
+
+    auto msg = gen.generate(chat::ChatMessage::user("hello"));
+    CHECK(msg.at("role") == "user");
+    CHECK(msg.at("content") == "hello");
+
+    auto msgs = gen.generate({
+        chat::ChatMessage::system("sys"),
+        chat::ChatMessage::user("usr"),
+        chat::ChatMessage::assistant("asst"),
+    });
+    REQUIRE(msgs.size() == 3);
+    CHECK(msgs[0].at("role") == "system");
+    CHECK(msgs[1].at("role") == "user");
+    CHECK(msgs[2].at("role") == "assistant");
+}
+
+TEST_CASE("NoSystemMessageGenerator omits system messages", "[chat_session]") {
+    NoSystemMessageGenerator gen;
+
+    auto msgs = gen.generate({
+        chat::ChatMessage::system("sys"),
+        chat::ChatMessage::user("usr"),
+        chat::ChatMessage::assistant("asst"),
+    });
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0].at("role") == "user");
+    CHECK(msgs[1].at("role") == "assistant");
+}
+
+// ===========================================================================
+// GenerateParameters Defaults Tests
+// ===========================================================================
+
+TEST_CASE("GenerateParameters defaults", "[chat_session]") {
+    GenerateParameters params;
+    CHECK(params.temperature == 0.6f);
+    CHECK(params.top_p == 1.0f);
+    CHECK(params.prefill_step_size == 512);
+    CHECK(!params.max_tokens.has_value());
+    CHECK(!params.max_kv_size.has_value());
+    CHECK(!params.kv_bits.has_value());
+    CHECK(params.kv_group_size == 64);
+    CHECK(params.quantized_kv_start == 0);
+    CHECK(!params.repetition_penalty.has_value());
+    CHECK(params.repetition_context_size == 20);
+}

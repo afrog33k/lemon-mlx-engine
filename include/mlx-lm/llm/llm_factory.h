@@ -1,0 +1,31 @@
+// Copyright © 2024-2025 Apple Inc. — Ported to C++
+#pragma once
+
+#include <mlx-lm/common/model_container.h>
+#include <mlx-lm/common/registry.h>
+#include <functional>
+#include <string>
+#include <unordered_map>
+
+namespace mlx_lm {
+
+// LLM type registry — maps model_type strings to factory functions.
+// Pre-populated with all supported LLM architectures.
+ModelTypeRegistry& llm_type_registry();
+
+// LLM model registry — known model configurations.
+AbstractModelRegistry& llm_model_registry();
+
+// Load an LLM model from a local directory.
+// The directory must contain config.json and *.safetensors files.
+ModelContext load_llm_from_directory(
+    const std::string& model_directory,
+    const ModelConfiguration& config = {});
+
+// Load an LLM model from a Hugging Face model ID.
+// Downloads if not cached locally.
+ModelContext load_llm(
+    const std::string& model_id,
+    const std::string& cache_dir = "");
+
+} // namespace mlx_lm

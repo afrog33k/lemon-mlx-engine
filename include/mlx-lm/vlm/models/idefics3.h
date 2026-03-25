@@ -1,0 +1,288 @@
+// Copyright © 2024-2025 Apple Inc. — Ported to C++
+// Port of Idefics3.swift — Idefics3 VLM (SigLip vision + Llama language + connector)
+#pragma once
+
+#include <mlx-lm/common/kv_cache.h>
+#include <mlx-lm/common/language_model.h>
+#include <mlx-lm/common/types.h>
+#include <mlx-lm/vlm/vlm_model.h>
+#include <mlx/mlx.h>
+#include <nlohmann/json.hpp>
+#include <cmath>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace mlx_lm {
+
+// ── Configuration ──────────────────────────────────────────────────────
+
+struct Idefics3TextConfiguration {
+    std::string model_type;
+    int hidden_size;
+    int num_hidden_layers = 32;
+    int intermediate_size;
+    int num_attention_heads;
+    int num_key_value_heads;
+    int vocab_size;
+    float rms_norm_eps = 1e-5f;
+    float rope_theta = 10000.0f;
+    bool rope_traditional = false;
+    bool tie_word_embeddings = false;
+
+    int head_dim() const { return hidden_size / num_attention_heads; }
+};
+
+struct Idefics3VisionConfiguration {
+    std::string model_type;
+    int num_hidden_layers = 12;
+    int hidden_size;
+    int intermediate_size = 3072;
+    int num_attention_heads;
+    int patch_size;
+    int image_size;
+    int num_channels = 3;
+    float layer_norm_eps = 1e-6f;
+
+    int num_positions() const {
+        return (image_size / patch_size) * (image_size / patch_size);
+    }
+};
+
+struct Idefics3Configuration {
+    Idefics3TextConfiguration text_config;
+    Idefics3VisionConfiguration vision_config;
+    std::string model_type;
+    int ignore_index = -100;
+    int vocab_size = 128259;
+    int scale_factor = 2;
+    int image_token_id = 49153;
+    int image_token_index;  // defaults to image_token_id
+};
+
+void from_json(const nlohmann::json& j, Idefics3TextConfiguration& c);
+void from_json(const nlohmann::json& j, Idefics3VisionConfiguration& c);
+void from_json(const nlohmann::json& j, Idefics3Configuration& c);
+
+// ── Vision Components (SigLip) ─────────────────────────────────────────
+
+// Patch embedding via Conv2d + learned positional embedding
+class Idefics3VisionEmbeddings {
+    mlx::core::array patch_embedding_weight_; // Conv2d kernel [out, kH, kW, in]
+    mlx::core::array position_embedding_weight_; // [num_positions, hidden_size]
+    int patch_size_, hidden_size_, num_positions_;
+
+public:
+    Idefics3VisionEmbeddings(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Multi-head self-attention with separate Q/K/V/out_proj projections (all with bias)
+class Idefics3VisionAttention {
+    int num_heads_, head_dim_;
+    float scale_;
+    mlx::core::array wq_weight_, wq_bias_;
+    mlx::core::array wk_weight_, wk_bias_;
+    mlx::core::array wv_weight_, wv_bias_;
+    mlx::core::array wo_weight_, wo_bias_;
+
+public:
+    Idefics3VisionAttention(int dims, int num_heads);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Vision MLP: fc1 -> GELU(precise) -> fc2 (both with bias)
+class Idefics3VisionMLP {
+    mlx::core::array fc1_weight_, fc1_bias_;
+    mlx::core::array fc2_weight_, fc2_bias_;
+
+public:
+    Idefics3VisionMLP(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Pre-norm encoder layer: LayerNorm -> Attention + residual, LayerNorm -> MLP + residual
+class Idefics3VisionEncoderLayer {
+    Idefics3VisionAttention attention_;
+    Idefics3VisionMLP mlp_;
+    mlx::core::array layer_norm1_weight_, layer_norm1_bias_;
+    mlx::core::array layer_norm2_weight_, layer_norm2_bias_;
+    float eps_;
+
+public:
+    explicit Idefics3VisionEncoderLayer(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Stack of encoder layers
+class Idefics3VisionEncoder {
+    std::vector<Idefics3VisionEncoderLayer> layers_;
+
+public:
+    explicit Idefics3VisionEncoder(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// SigLip vision model: embeddings -> encoder -> post_layernorm
+class Idefics3VisionInnerModel {
+    Idefics3VisionEmbeddings embeddings_;
+    Idefics3VisionEncoder encoder_;
+    mlx::core::array post_layernorm_weight_, post_layernorm_bias_;
+    float eps_;
+
+public:
+    explicit Idefics3VisionInnerModel(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Vision model wrapper with weight sanitization (conv format conversion)
+class Idefics3VisionModel {
+    Idefics3VisionInnerModel vision_model_;
+    int num_channels_;
+
+public:
+    explicit Idefics3VisionModel(const Idefics3VisionConfiguration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array> sanitize(
+        std::unordered_map<std::string, mlx::core::array> weights);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// ── Connector (Pixel Shuffle + MLP) ────────────────────────────────────
+
+// Connector MLP: linear projection (no bias)
+class Idefics3ConnectorMLP {
+    mlx::core::array proj_weight_;  // [text_hidden_size, vision_hidden_size * sf^2]
+
+public:
+    Idefics3ConnectorMLP(const Idefics3Configuration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Idefics3Connector: pixel shuffle then MLP projection
+class Idefics3Connector {
+    Idefics3ConnectorMLP modality_projection_;
+    int scale_factor_;
+
+    mlx::core::array pixel_shuffle(const mlx::core::array& x, int scale_factor);
+
+public:
+    explicit Idefics3Connector(const Idefics3Configuration& config);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// ── Language Components (Llama-style) ──────────────────────────────────
+
+// Llama-style attention: no bias on Q/K/V/O, RoPE applied
+class Idefics3LanguageAttention {
+    int heads_, kv_heads_, head_dim_;
+    float scale_, rope_theta_;
+    bool rope_traditional_;
+    mlx::core::array wq_weight_, wk_weight_, wv_weight_, wo_weight_;
+
+public:
+    explicit Idefics3LanguageAttention(const Idefics3TextConfiguration& args);
+    mlx::core::array operator()(const mlx::core::array& x,
+                                 const AttentionMask& mask,
+                                 KVCache* cache);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Llama MLP: gate/up/down projections with SiLU activation, no bias
+class Idefics3LanguageMLP {
+    mlx::core::array gate_weight_, down_weight_, up_weight_;
+
+public:
+    Idefics3LanguageMLP(int dimensions, int hidden_dimensions);
+    mlx::core::array operator()(const mlx::core::array& x);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Llama transformer block with RMSNorm
+class Idefics3TransformerBlock {
+    Idefics3LanguageAttention attention_;
+    Idefics3LanguageMLP mlp_;
+    mlx::core::array input_layernorm_weight_;
+    mlx::core::array post_attention_layernorm_weight_;
+    float rms_norm_eps_;
+
+public:
+    explicit Idefics3TransformerBlock(const Idefics3TextConfiguration& args);
+    mlx::core::array operator()(const mlx::core::array& x,
+                                 const AttentionMask& mask,
+                                 KVCache* cache);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Inner language model: embed + layers + norm
+class Idefics3LanguageModelInner {
+    mlx::core::array embed_tokens_weight_;
+    std::vector<Idefics3TransformerBlock> layers_;
+    mlx::core::array norm_weight_;
+    float rms_norm_eps_;
+
+public:
+    explicit Idefics3LanguageModelInner(const Idefics3TextConfiguration& args);
+    mlx::core::array operator()(const std::optional<mlx::core::array>& inputs,
+                                 std::vector<KVCache>* cache = nullptr,
+                                 const std::optional<mlx::core::array>& input_embedding = std::nullopt);
+    mlx::core::array embed_tokens(const mlx::core::array& ids) const;
+    mlx::core::array embed_as_linear(const mlx::core::array& x) const;
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// Language model wrapper with optional lm_head (when tie_word_embeddings=false)
+class Idefics3LanguageModel {
+    Idefics3LanguageModelInner model_;
+    std::optional<mlx::core::array> lm_head_weight_;
+    std::vector<int> kv_heads_;
+
+public:
+    explicit Idefics3LanguageModel(const Idefics3TextConfiguration& args);
+    LMOutput operator()(const std::optional<mlx::core::array>& inputs,
+                        std::vector<KVCache>* cache = nullptr,
+                        const std::optional<mlx::core::array>& input_embedding = std::nullopt);
+    const std::vector<int>& kv_heads() const { return kv_heads_; }
+    Idefics3LanguageModelInner& inner() { return model_; }
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+// ── Top-Level Idefics3 Model ───────────────────────────────────────────
+
+class Idefics3Model
+    : public VLMModel<Idefics3Model>,
+      public KVCacheDimensionProvider<Idefics3Model> {
+
+    friend class LanguageModel<Idefics3Model>;
+    friend class KVCacheDimensionProvider<Idefics3Model>;
+
+    Idefics3Configuration config_;
+    Idefics3VisionModel vision_model_;
+    Idefics3LanguageModel language_model_;
+    Idefics3Connector connector_;
+    std::vector<int> kv_heads_cache_;
+
+    // CRTP implementations
+    PrepareResult prepare_impl(const LMInput& input, std::vector<KVCache>& cache, int window_size);
+    LMOutput call_impl(const LMInput::Text& input, std::vector<KVCache>* cache, const LMOutput::State* state);
+    mlx::core::array forward_impl(const mlx::core::array& inputs, std::vector<KVCache>* cache);
+    std::unordered_map<std::string, mlx::core::array> sanitize_impl(
+        std::unordered_map<std::string, mlx::core::array> weights);
+
+public:
+    explicit Idefics3Model(const Idefics3Configuration& config);
+    const std::vector<int>& kv_heads() const { return kv_heads_cache_; }
+    void load_weights(const std::unordered_map<std::string, mlx::core::array>& weights);
+    std::unordered_map<std::string, mlx::core::array*> weight_map();
+};
+
+} // namespace mlx_lm
