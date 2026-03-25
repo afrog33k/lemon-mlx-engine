@@ -11,11 +11,11 @@ option(MLX_LM_BUILD_EXAMPLES "Build example programs" ON)
 # Third-party dependencies
 include(FetchContent)
 
-# MLX C++
+# MLX C++ (lemonade-sdk fork with ROCm/AMD GPU support)
 FetchContent_Declare(
     mlx
-    GIT_REPOSITORY https://github.com/ml-explore/mlx.git
-    GIT_TAG        main
+    GIT_REPOSITORY https://github.com/lemonade-sdk/lemon-mlx-core-amd.git
+    GIT_TAG        rocm-support
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(mlx)
