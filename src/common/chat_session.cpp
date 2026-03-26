@@ -175,6 +175,7 @@ void ChatSession::generate_impl(
             throw std::runtime_error("ChatSession: chat template produced no tokens");
         }
 
+
         // Create token array
         auto token_array = mx::array(
             tokens.data(),

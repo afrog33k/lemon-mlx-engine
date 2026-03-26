@@ -77,8 +77,8 @@ mx::array merge_input_ids_with_image_features(
                                      {0, static_cast<int>(i), 0},
                                      {1, static_cast<int>(i) + 1, features.shape(-1)});
         result = mx::slice_update(result, feat_slice,
-                                   {0, idx, 0},
-                                   {1, idx + 1, result.shape(-1)});
+                                   mx::Shape{0, idx, 0},
+                                   mx::Shape{1, idx + 1, result.shape(-1)});
     }
 
     return result;

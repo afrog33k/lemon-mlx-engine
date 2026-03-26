@@ -215,7 +215,7 @@ LMOutput Qwen3Model::call_impl(const LMInput::Text& input, std::vector<KVCache>*
 
 mx::array Qwen3Model::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
     auto out = model_(inputs, cache);
-    if (lm_head_weight_.has_value()) return mx::matmul(out, mx::transpose(lm_head_weight_.value()));
+    if (lm_head_weight_.has_value()) return linear_fwd(out, lm_head_weight_.value());
     return model_.embed_as_linear(out);
 }
 

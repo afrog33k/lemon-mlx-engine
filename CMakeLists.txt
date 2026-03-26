@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(mlx-cpp-lm VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -10,6 +10,14 @@ option(MLX_LM_BUILD_EXAMPLES "Build example programs" ON)
 
 # Third-party dependencies
 include(FetchContent)
+
+# Enable ROCm/AMD GPU backend on non-Apple platforms
+if(NOT APPLE)
+    set(MLX_BUILD_ROCM ON CACHE BOOL "Build ROCm backend" FORCE)
+    set(CMAKE_HIP_ARCHITECTURES
+        "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
+        CACHE STRING "HIP architectures" FORCE)
+endif()
 
 # MLX C++ (lemonade-sdk fork with ROCm/AMD GPU support)
 FetchContent_Declare(

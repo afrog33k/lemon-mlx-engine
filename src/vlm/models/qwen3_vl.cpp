@@ -283,8 +283,8 @@ mx::array Qwen3VLVisionAttention::operator()(
         if (start < end) {
             auto zeros_block = mx::zeros({1, end - start, end - start}, q.dtype());
             mask = mx::slice_update(mask, zeros_block,
-                                     {0, start, start},
-                                     {1, end, end});
+                                     mx::Shape{0, start, start},
+                                     mx::Shape{1, end, end});
         }
     }
 
@@ -1017,8 +1017,8 @@ mx::array Qwen3VLLanguageModelInner::operator()(
                                           {static_cast<int>(vi), 0},
                                           {static_cast<int>(vi) + 1, h.shape(-1)});
                     h_squeezed = mx::slice_update(h_squeezed, val,
-                                                   {idx, 0},
-                                                   {idx + 1, h.shape(-1)});
+                                                   mx::Shape{idx, 0},
+                                                   mx::Shape{idx + 1, h.shape(-1)});
                 }
                 h = mx::expand_dims(h_squeezed, 0);
             }
@@ -1439,7 +1439,7 @@ std::pair<mx::array, mx::array> Qwen3VLModel::merge_input_ids_with_image_feature
             auto feat_val = mx::slice(flat_features,
                                        {static_cast<int>(i)},
                                        {static_cast<int>(i) + 1});
-            result = mx::slice_update(result, feat_val, {idx}, {idx + 1});
+            result = mx::slice_update(result, feat_val, mx::Shape{idx}, mx::Shape{idx + 1});
         }
     }
 
