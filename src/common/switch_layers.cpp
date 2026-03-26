@@ -5,6 +5,7 @@
 #include <mlx-lm/common/activations.h>
 #include <mlx-lm/common/quantized_linear.h>
 #include <cmath>
+#include <iostream>
 
 namespace mx = mlx::core;
 

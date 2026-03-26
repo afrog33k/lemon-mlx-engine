@@ -655,24 +655,54 @@ Qwen3NextModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
         }
     }
 
-    // Stack per-expert weights into SwitchGLU format
+    // Stack per-expert weights (and their scales/biases) into SwitchGLU format.
+    // The individual expert weights are stacked along axis 0 to create
+    // [E, N, K] shaped tensors. Scales and biases must also be stacked so that
+    // register_quantized_weights can associate them with the stacked weight.
     if (weights.find("model.layers.0.mlp.experts.0.up_proj.weight") == weights.end()) {
         // No expert stacking needed — apply norm + conv1d fixups only
     } else {
         for (int l = 0; l < config_.num_hidden_layers; ++l) {
             std::string prefix = "model.layers." + std::to_string(l) + ".mlp.";
             for (const auto& n : {"up_proj", "down_proj", "gate_proj"}) {
+                // Stack weights
                 std::string key0 = prefix + "experts.0." + n + ".weight";
-                if (weights.find(key0) != weights.end()) {
-                    std::vector<mx::array> to_join;
-                    to_join.reserve(config_.num_experts);
-                    for (int e = 0; e < config_.num_experts; ++e) {
-                        std::string ek = prefix + "experts." + std::to_string(e) + "." + n + ".weight";
-                        auto it = weights.find(ek);
-                        to_join.push_back(std::move(it->second));
-                        weights.erase(it);
+                if (weights.find(key0) == weights.end()) continue;
+
+                std::vector<mx::array> w_join, s_join, b_join;
+                w_join.reserve(config_.num_experts);
+                s_join.reserve(config_.num_experts);
+                b_join.reserve(config_.num_experts);
+                bool has_biases = false;
+
+                for (int e = 0; e < config_.num_experts; ++e) {
+                    std::string ep = prefix + "experts." + std::to_string(e) + "." + n;
+                    // Weight
+                    auto wit = weights.find(ep + ".weight");
+                    w_join.push_back(std::move(wit->second));
+                    weights.erase(wit);
+                    // Scales
+                    auto sit = weights.find(ep + ".scales");
+                    if (sit != weights.end()) {
+                        s_join.push_back(std::move(sit->second));
+                        weights.erase(sit);
                     }
-                    weights.insert_or_assign(prefix + "switch_mlp." + n + ".weight", mx::stack(to_join));
+                    // Biases
+                    auto bit = weights.find(ep + ".biases");
+                    if (bit != weights.end()) {
+                        b_join.push_back(std::move(bit->second));
+                        weights.erase(bit);
+                        has_biases = true;
+                    }
+                }
+
+                std::string dst = prefix + "switch_mlp." + n;
+                weights.insert_or_assign(dst + ".weight", mx::stack(w_join));
+                if (!s_join.empty()) {
+                    weights.insert_or_assign(dst + ".scales", mx::stack(s_join));
+                }
+                if (has_biases && !b_join.empty()) {
+                    weights.insert_or_assign(dst + ".biases", mx::stack(b_join));
                 }
             }
         }
