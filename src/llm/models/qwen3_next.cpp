@@ -274,48 +274,117 @@ mx::array Qwen3NextGatedDeltaNet::operator()(
         (*cache)[0] = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
     }
 
-    // Conv1d + silu. For T=1 decode, replace conv1d with compiled element-wise
-    // dot product to avoid conv overhead: conv_input is [B, K, C], weight is [C, K, 1].
-    mx::array conv_out(0.0f);
-    if (S == 1 && conv_input.shape(1) == conv_kernel_size_) {
-        // weight: [C, K, 1] → [C, K] → transpose → [K, C] → [1, K, C]
+    // *** T=1 DECODE FAST PATH ***
+    // Fuse conv_silu + split + norms + beta/g + recurrence into minimal launches.
+    if (S == 1 && cache && (*cache)[0].has_value() && conv_input.shape(1) == conv_kernel_size_) {
+        // 1. Fused conv1d + silu (1 compiled kernel)
         auto w = mx::reshape(
             mx::transpose(mx::reshape(conv1d_weight_, {conv_dim_, conv_kernel_size_})),
             {1, conv_kernel_size_, conv_dim_});
         static auto compiled_conv_silu = mx::compile(
             [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
                 auto dot = mx::sum(mx::multiply(inputs[0], inputs[1]), 1, true);
-                return {mx::multiply(dot, mx::sigmoid(dot))}; // silu
+                return {mx::multiply(dot, mx::sigmoid(dot))};
             },
             /*shapeless=*/true);
-        conv_out = compiled_conv_silu({conv_input, w})[0];
-    } else {
-        conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
-        conv_out = silu(conv_out);
+        auto conv_out = compiled_conv_silu({conv_input, w})[0];
+
+        // 2. Split + reshape (zero-cost views)
+        auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, 1, key_dim_}),
+                                  {B, 1, num_k_heads_, head_k_dim_});
+        auto k_out = mx::reshape(mx::slice(conv_out, {0, 0, key_dim_}, {B, 1, 2 * key_dim_}),
+                                  {B, 1, num_k_heads_, head_k_dim_});
+        auto v_out = mx::reshape(mx::slice(conv_out, {0, 0, 2 * key_dim_}, {B, 1, conv_dim_}),
+                                  {B, 1, num_v_heads_, head_v_dim_});
+
+        // 3. Q/K norms (2 fast kernels via rms_norm)
+        float inv_scale = std::pow(static_cast<float>(head_k_dim_), -0.5f);
+        auto q_norm_w = mx::full({head_k_dim_}, inv_scale * inv_scale, dtype);
+        auto k_norm_w = mx::full({head_k_dim_}, inv_scale, dtype);
+        q_out = mx::fast::rms_norm(q_out, q_norm_w, 1e-6f);
+        k_out = mx::fast::rms_norm(k_out, k_norm_w, 1e-6f);
+
+        // 4. Fused beta + g (1 compiled kernel)
+        // 5. Fused GDN step with head repeat (1 compiled kernel)
+        auto ssm_state = (*cache)[1].has_value() ? (*cache)[1].value()
+                           : mx::zeros({B, num_v_heads_, head_v_dim_, head_k_dim_}, dtype);
+
+        // Mega-fused: beta/g computation + head repeat + recurrence step
+        int rep = num_v_heads_ / num_k_heads_;
+        static auto compiled_decode_step = mx::compile(
+            [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+                // inputs: q[B,1,Hk,Dk], k[B,1,Hk,Dk], v[B,1,Hv,Dv],
+                //         b[B,1,Hv], a_log[Hv], a[B,1,Hv], dt_bias[Hv],
+                //         state[B,Hv,Dv,Dk], rep_factor
+                auto q = inputs[0]; auto k = inputs[1]; auto v = inputs[2];
+                auto b = inputs[3]; auto a_log = inputs[4]; auto a = inputs[5];
+                auto dt_bias = inputs[6]; auto state = inputs[7];
+
+                int B_ = q.shape(0), Hk_ = q.shape(2), Dk_ = q.shape(3);
+                int Hv_ = v.shape(2), Dv_ = v.shape(3);
+                int rep_ = Hv_ / Hk_;
+
+                // beta + g fused
+                auto beta = mx::sigmoid(b);
+                auto a_log_f32 = mx::astype(a_log, mx::float32);
+                auto sp = mx::log(mx::add(mx::exp(mx::add(a, dt_bias)), mx::array(1.0f)));
+                auto g = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), sp)));
+                g = mx::astype(g, a.dtype());
+
+                // Squeeze T=1
+                auto qt = mx::reshape(q, {B_, Hk_, Dk_});
+                auto kt = mx::reshape(k, {B_, Hk_, Dk_});
+                auto vt = mx::reshape(v, {B_, Hv_, Dv_});
+                auto gt = mx::reshape(g, {B_, Hv_});
+                auto bt = mx::reshape(beta, {B_, Hv_});
+
+                // Repeat q/k heads
+                if (rep_ > 1) {
+                    qt = mx::reshape(mx::broadcast_to(
+                        mx::reshape(qt, {B_, Hk_, 1, Dk_}), {B_, Hk_, rep_, Dk_}), {B_, Hv_, Dk_});
+                    kt = mx::reshape(mx::broadcast_to(
+                        mx::reshape(kt, {B_, Hk_, 1, Dk_}), {B_, Hk_, rep_, Dk_}), {B_, Hv_, Dk_});
+                }
+
+                // GDN recurrence
+                auto decay = mx::expand_dims(mx::expand_dims(gt, -1), -1);
+                auto s = mx::multiply(state, decay);
+                auto kv_mem = mx::sum(mx::multiply(s, mx::expand_dims(kt, -2)), -1);
+                auto delta = mx::multiply(mx::subtract(vt, kv_mem), mx::expand_dims(bt, -1));
+                s = mx::add(s, mx::multiply(mx::expand_dims(kt, -2), mx::expand_dims(delta, -1)));
+                auto y = mx::sum(mx::multiply(s, mx::expand_dims(qt, -2)), -1);
+
+                return {mx::expand_dims(y, 1), s};
+            },
+            /*shapeless=*/true);
+
+        auto results = compiled_decode_step(
+            {q_out, k_out, v_out, b_val, a_log_, a_val, dt_bias_, ssm_state});
+        auto out = results[0];
+        (*cache)[1] = results[1];
+
+        // 6. Gated norm + output projection
+        auto normalized = norm_(out, z);
+        return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
     }
 
-    // Split conv output into q, k, v
-    auto q_out = mx::reshape(
-        mx::slice(conv_out, {0, 0, 0}, {B, S, key_dim_}),
-        {B, S, num_k_heads_, head_k_dim_});
-    auto k_out = mx::reshape(
-        mx::slice(conv_out, {0, 0, key_dim_}, {B, S, 2 * key_dim_}),
-        {B, S, num_k_heads_, head_k_dim_});
-    auto v_out = mx::reshape(
-        mx::slice(conv_out, {0, 0, 2 * key_dim_}, {B, S, conv_dim_}),
-        {B, S, num_v_heads_, head_v_dim_});
+    // *** GENERAL PATH: T>1 prefill ***
+    auto conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
+    conv_out = silu(conv_out);
 
-    // Q/K L2-norm + scale. Equivalent to Swift's:
-    //   q = invScale^2 * rmsNorm(q, weight=None, eps=1e-6)
-    //   k = invScale   * rmsNorm(k, weight=None, eps=1e-6)
-    // Use rms_norm with constant weight vector to fuse the scale into the norm kernel.
+    auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, S, key_dim_}),
+                              {B, S, num_k_heads_, head_k_dim_});
+    auto k_out = mx::reshape(mx::slice(conv_out, {0, 0, key_dim_}, {B, S, 2 * key_dim_}),
+                              {B, S, num_k_heads_, head_k_dim_});
+    auto v_out = mx::reshape(mx::slice(conv_out, {0, 0, 2 * key_dim_}, {B, S, conv_dim_}),
+                              {B, S, num_v_heads_, head_v_dim_});
+
     float inv_scale = std::pow(static_cast<float>(head_k_dim_), -0.5f);
     auto q_norm_w = mx::full({head_k_dim_}, inv_scale * inv_scale, q_out.dtype());
     auto k_norm_w = mx::full({head_k_dim_}, inv_scale, k_out.dtype());
     q_out = mx::fast::rms_norm(q_out, q_norm_w, 1e-6f);
     k_out = mx::fast::rms_norm(k_out, k_norm_w, 1e-6f);
 
-    // Gated delta update
     std::optional<mx::array> ssm_state;
     if (cache && (*cache)[1].has_value()) {
         ssm_state = (*cache)[1].value();
@@ -328,10 +397,8 @@ mx::array Qwen3NextGatedDeltaNet::operator()(
         (*cache)[1] = new_state;
     }
 
-    // Apply gated norm: norm(out, gate=z)
     auto normalized = norm_(out, z);
-    auto final_out = linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
-    return final_out;
+    return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen3NextGatedDeltaNet::weight_map() {
