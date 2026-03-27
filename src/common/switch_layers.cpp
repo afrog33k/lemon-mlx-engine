@@ -20,7 +20,6 @@ gather_sort(const mx::array& x, const mx::array& indices) {
     auto order = mx::argsort(flat_indices);
     auto inverse_order = mx::argsort(order);
 
-    // x.flatten(0, -3) then index by order / m
     auto x_flat = mx::flatten(x, 0, x.ndim() - 3);
     auto sorted_x = mx::take(x_flat, mx::floor_divide(order, mx::array(m)), 0);
     auto sorted_indices = mx::take(flat_indices, order);
@@ -62,13 +61,10 @@ mx::array SwitchLinear::operator()(
     const mx::array& indices,
     bool sorted_indices)
 {
-    // Check if weight is quantized via the QuantizedWeightRegistry.
     auto* qi = QuantizedWeightRegistry::instance().find(&weight_);
 
     mx::array result(0.0f);
     if (qi) {
-        // Quantized path: use gather_qmm with the same index semantics as gather_mm.
-        // rhs_indices selects which expert's weight matrix to use per token.
         result = mx::gather_qmm(
             x, weight_, qi->scales, qi->biases,
             /*lhs_indices=*/std::nullopt,
@@ -79,7 +75,6 @@ mx::array SwitchLinear::operator()(
             /*mode=*/"affine",
             /*sorted_indices=*/sorted_indices);
     } else {
-        // Non-quantized path: transpose and use gather_mm
         auto weight_t = mx::swapaxes(weight_, -1, -2);
         result = mx::gather_mm(x, weight_t, std::nullopt, indices, sorted_indices);
     }

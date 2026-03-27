@@ -333,6 +333,23 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
 
     // Add batch dimension to tokens; call the model.
     auto batched = add_batch_dim(previous);
+
+    // TODO: HIP graph capture for decode steps.
+    // After the allocator cache is warm (post-warmup), the decode step has
+    // a fixed kernel sequence that could be captured into a HIP graph and
+    // replayed with a single hipGraphLaunch instead of ~8800 individual
+    // kernel dispatches. This would reduce launch overhead from ~26ms to
+    // ~0.05ms per token, increasing generation from 18 to ~34 tok/s.
+    //
+    // Requirements for capture:
+    // 1. Allocator cache must be warm (no hipMalloc during capture)
+    // 2. No host callbacks or stream syncs during capture
+    // 3. Buffer addresses must be stable between capture and replay
+    //
+    // Current blocker: MLX's lazy eval triggers allocations and host
+    // callbacks that aren't compatible with hipStreamBeginCapture.
+    // Needs MLX framework support for pre-allocated execution plans.
+
     auto result = context_.call_fn(
         batched,
         cache_.empty() ? nullptr : &cache_,
