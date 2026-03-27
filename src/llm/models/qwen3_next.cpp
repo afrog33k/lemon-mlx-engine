@@ -1,13 +1,15 @@
-// Copyright © 2024-2025 Apple Inc. — Ported to C++
-// Port of Qwen3Next.swift — Hybrid GatedDeltaNet + Attention + MoE
+// Copyright (c) 2024-2025 Apple Inc. -- Ported to C++
+// Port of Qwen3Next.swift -- Hybrid GatedDeltaNet + Attention + MoE
+//
+// Faithful 1:1 port from Swift reference. No compiled kernels, no debug code,
+// no float32 upcast in gated_delta_ops, no T=1 fast paths for conv1d.
 
 #include <mlx-lm/llm/models/qwen3_next.h>
 #include <mlx-lm/common/attention_utils.h>
 #include <mlx-lm/common/activations.h>
+#include <mlx-lm/common/quantized_linear.h>
 #include <algorithm>
 #include <cmath>
-#include <iostream>
-#include <mlx-lm/common/quantized_linear.h>
 
 namespace mx = mlx::core;
 
@@ -65,204 +67,6 @@ static mx::array linear_fwd(const mx::array& x, const mx::array& w,
     return linear_forward(x, w, bias.has_value() ? &bias.value() : nullptr);
 }
 
-// --- Gated Delta Net Helper Functions ---
-
-mx::array compute_gated_delta_g(
-    const mx::array& a_log, const mx::array& a, const mx::array& dt_bias)
-{
-    // decay = exp(-exp(a_log.float32) * softplus(a + dt_bias))
-    // Fuse all element-wise ops into a single compiled kernel to minimize launches.
-    static auto compiled = mx::compile(
-        [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-            auto a_log_f32 = mx::astype(inputs[0], mx::float32);
-            auto softplus_val = mx::log(mx::add(mx::exp(mx::add(inputs[1], inputs[2])), mx::array(1.0f)));
-            auto decay = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), softplus_val)));
-            return {mx::astype(decay, inputs[0].dtype())};
-        },
-        /*shapeless=*/true);
-    return compiled({a_log, a, dt_bias})[0];
-}
-
-// Compiled gated delta step: fuses ~9 kernel launches into ~2.
-// Inputs: [q, k, v, g, beta, state] → Outputs: [y, s_new]
-// q: [B, Hv, Dk], k: [B, Hv, Dk], v: [B, Hv, Dv], g: [B, Hv],
-// beta: [B, Hv], state: [B, Hv, Dv, Dk]
-static auto compiled_gated_delta_step = mx::compile(
-    [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-        auto& q = inputs[0];
-        auto& k = inputs[1];
-        auto& v = inputs[2];
-        auto& g = inputs[3];
-        auto& beta = inputs[4];
-        auto& state = inputs[5];
-
-        // Expand decay: [B, Hv] → [B, Hv, 1, 1]
-        auto decay = mx::expand_dims(mx::expand_dims(g, -1), -1);
-
-        // State update
-        auto s = mx::multiply(state, decay);
-        auto kv_mem = mx::sum(mx::multiply(s, mx::expand_dims(k, -2)), -1);
-        auto delta = mx::multiply(mx::subtract(v, kv_mem), mx::expand_dims(beta, -1));
-        s = mx::add(s, mx::multiply(mx::expand_dims(k, -2), mx::expand_dims(delta, -1)));
-        auto y = mx::sum(mx::multiply(s, mx::expand_dims(q, -2)), -1);
-
-        return {y, s};
-    },
-    /*shapeless=*/true);
-
-std::pair<mx::array, mx::array> gated_delta_step_ops(
-    const mx::array& q, const mx::array& k,
-    const mx::array& v, const mx::array& g,
-    const mx::array& beta, const mx::array& state,
-    const std::optional<mx::array>& mask)
-{
-    // For the common decode case (no mask, g.ndim==2), use the compiled kernel.
-    if (!mask.has_value() && g.ndim() == 2) {
-        auto results = compiled_gated_delta_step({q, k, v, g, beta, state});
-        return {results[0], results[1]};
-    }
-
-    // Fallback for masked or unusual-rank cases
-    auto old_state = state;
-
-    mx::array decay(0.0f);
-    if (g.ndim() == 2) {
-        decay = mx::expand_dims(mx::expand_dims(g, -1), -1);
-    } else if (g.ndim() == 3) {
-        decay = mx::expand_dims(g, -2);
-    }
-
-    auto s = mx::multiply(state, decay);
-    auto kv_mem = mx::sum(mx::multiply(s, mx::expand_dims(k, -2)), -1);
-    auto delta = mx::multiply(mx::subtract(v, kv_mem), mx::expand_dims(beta, -1));
-    s = mx::add(s, mx::multiply(mx::expand_dims(k, -2), mx::expand_dims(delta, -1)));
-    auto y = mx::sum(mx::multiply(s, mx::expand_dims(q, -2)), -1);
-
-    if (mask.has_value()) {
-        mx::array expanded_mask(0.0f);
-        if (mask->ndim() == 1) {
-            expanded_mask = mx::expand_dims(mx::expand_dims(mx::expand_dims(*mask, -1), -1), -1);
-        } else if (mask->ndim() == 2) {
-            expanded_mask = mx::expand_dims(mx::expand_dims(*mask, -1), -1);
-        } else if (mask->ndim() == 3) {
-            expanded_mask = mx::expand_dims(*mask, -1);
-        }
-        s = mx::where(expanded_mask, s, old_state);
-    }
-
-    return {y, s};
-}
-
-// Repeat q/k from Hk to Hv heads by tiling along axis 2.
-// Uses reshape + broadcast + reshape instead of concatenate to avoid an extra kernel.
-static mx::array repeat_heads(const mx::array& x, int repeat_factor) {
-    if (repeat_factor <= 1) return x;
-    // x: [B, T, Hk, D] → [B, T, Hk, 1, D] → broadcast [B, T, Hk, rep, D] → [B, T, Hk*rep, D]
-    int B = x.shape(0), T = x.shape(1), Hk = x.shape(2), D = x.shape(3);
-    auto expanded = mx::reshape(x, {B, T, Hk, 1, D});
-    auto tiled = mx::broadcast_to(expanded, {B, T, Hk, repeat_factor, D});
-    return mx::reshape(tiled, {B, T, Hk * repeat_factor, D});
-}
-
-std::pair<mx::array, mx::array> gated_delta_ops(
-    const mx::array& q, const mx::array& k,
-    const mx::array& v, const mx::array& g,
-    const mx::array& beta,
-    const std::optional<mx::array>& state,
-    const std::optional<mx::array>& mask)
-{
-    int B = q.shape(0), T = q.shape(1);
-    int Hk = q.shape(2), Dk = q.shape(3);
-    int Hv = v.shape(2), Dv = v.shape(3);
-    int repeat_factor = Hv / Hk;
-
-    auto s = state.value_or(mx::zeros({B, Hv, Dv, Dk}, q.dtype()));
-
-    // *** FAST PATH: T=1 decode (no loop, no slice/squeeze/concatenate) ***
-    if (T == 1 && !mask.has_value()) {
-        // Squeeze the time dimension directly via reshape
-        auto q_t = mx::reshape(q, {B, Hk, Dk});
-        auto k_t = mx::reshape(k, {B, Hk, Dk});
-        auto v_t = mx::reshape(v, {B, Hv, Dv});
-        auto g_t = mx::reshape(g, {B, g.shape(2)});
-        auto beta_t = mx::reshape(beta, {B, beta.shape(2)});
-
-        // Repeat q/k heads if needed (broadcast, no data copy)
-        if (repeat_factor > 1) {
-            q_t = mx::reshape(mx::broadcast_to(
-                mx::reshape(q_t, {B, Hk, 1, Dk}), {B, Hk, repeat_factor, Dk}),
-                {B, Hv, Dk});
-            k_t = mx::reshape(mx::broadcast_to(
-                mx::reshape(k_t, {B, Hk, 1, Dk}), {B, Hk, repeat_factor, Dk}),
-                {B, Hv, Dk});
-        }
-
-        auto [y, new_s] = gated_delta_step_ops(q_t, k_t, v_t, g_t, beta_t, s, std::nullopt);
-        // Restore time dimension
-        return {mx::expand_dims(y, 1), new_s};
-    }
-
-    // *** GENERAL PATH: T>1 prefill ***
-    auto q_work = repeat_heads(q, repeat_factor);
-    auto k_work = repeat_heads(k, repeat_factor);
-
-    std::vector<mx::array> ys;
-    ys.reserve(T);
-
-    for (int t = 0; t < T; ++t) {
-        auto q_t = mx::squeeze(mx::slice(q_work, {0, t, 0, 0}, {B, t + 1, q_work.shape(2), Dk}), 1);
-        auto k_t = mx::squeeze(mx::slice(k_work, {0, t, 0, 0}, {B, t + 1, k_work.shape(2), Dk}), 1);
-        auto v_t = mx::squeeze(mx::slice(v, {0, t, 0, 0}, {B, t + 1, Hv, Dv}), 1);
-        auto g_t = mx::squeeze(mx::slice(g, {0, t, 0}, {B, t + 1, g.shape(2)}), 1);
-        auto beta_t = mx::squeeze(mx::slice(beta, {0, t, 0}, {B, t + 1, beta.shape(2)}), 1);
-
-        std::optional<mx::array> mask_t;
-        if (mask.has_value()) {
-            mask_t = mx::squeeze(mx::slice(*mask, {0, t}, {B, t + 1}), 1);
-        }
-
-        auto [y, new_s] = gated_delta_step_ops(q_t, k_t, v_t, g_t, beta_t, s, mask_t);
-        ys.push_back(mx::expand_dims(y, 1));
-        s = new_s;
-    }
-
-    return {mx::concatenate(ys, 1), s};
-}
-
-// Fuse sigmoid(b) + compute_gated_delta_g into one compiled kernel.
-// Inputs: [b, a_log, a, dt_bias] → [beta, g]
-static auto compiled_beta_and_g = mx::compile(
-    [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-        auto beta = mx::sigmoid(inputs[0]);
-        // decay = exp(-exp(float32(a_log)) * softplus(a + dt_bias))
-        auto a_log_f32 = mx::astype(inputs[1], mx::float32);
-        auto softplus_val = mx::log(mx::add(mx::exp(mx::add(inputs[2], inputs[3])), mx::array(1.0f)));
-        auto g = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), softplus_val)));
-        g = mx::astype(g, inputs[1].dtype());
-        return {beta, g};
-    },
-    /*shapeless=*/true);
-
-std::pair<mx::array, mx::array> gated_delta_update(
-    const mx::array& q, const mx::array& k,
-    const mx::array& v, const mx::array& a,
-    const mx::array& b, const mx::array& a_log,
-    const mx::array& dt_bias,
-    const std::optional<mx::array>& state,
-    const std::optional<mx::array>& mask)
-{
-    auto bg = compiled_beta_and_g({b, a_log, a, dt_bias});
-    auto& beta = bg[0];
-    auto& g = bg[1];
-
-    int B = q.shape(0), Dk = q.shape(3);
-    int Hv = v.shape(2), Dv = v.shape(3);
-
-    auto s = state.value_or(mx::zeros({B, Hv, Dv, Dk}, q.dtype()));
-
-    return gated_delta_ops(q, k, v, g, beta, s, mask);
-}
-
 // --- Qwen3NextRMSNormGated ---
 
 Qwen3NextRMSNormGated::Qwen3NextRMSNormGated(int dimensions, float eps)
@@ -273,6 +77,7 @@ mx::array Qwen3NextRMSNormGated::operator()(const mx::array& x,
                                               const std::optional<mx::array>& gate) {
     auto result = mx::fast::rms_norm(x, weight_, eps_);
     if (gate.has_value()) {
+        // Swift: silu(gate) * result
         result = swiglu(*gate, result);
     }
     return result;
@@ -283,13 +88,14 @@ std::unordered_map<std::string, mx::array*> Qwen3NextRMSNormGated::weight_map() 
 }
 
 // --- Qwen3NextAttention ---
+// Swift: Qwen3NextAttention -- standard attention for full-attention layers
 
 Qwen3NextAttention::Qwen3NextAttention(const Qwen3NextConfiguration& args)
     : num_heads_(args.num_attention_heads),
       num_kv_heads_(args.num_key_value_heads),
       head_dim_(args.resolved_head_dim()),
       scale_(std::pow(static_cast<float>(args.resolved_head_dim()), -0.5f)),
-      // q_proj outputs 2x for the sigmoid gate
+      // q_proj outputs 2x head_dim for the sigmoid gate
       q_proj_weight_(mx::zeros({args.num_attention_heads * args.resolved_head_dim() * 2, args.hidden_size})),
       k_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
       v_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
@@ -316,7 +122,6 @@ mx::array Qwen3NextAttention::operator()(const mx::array& x,
     auto q_proj_out = linear_fwd(x, q_proj_weight_, q_proj_bias_);
     // Reshape to [B, L, num_heads, 2*head_dim] then split into queries + gate
     q_proj_out = mx::reshape(q_proj_out, {B, L, num_heads_, -1});
-    // Split along last dim into 2 equal parts
     int hd = head_dim_;
     auto queries = mx::slice(q_proj_out, {0, 0, 0, 0}, {B, L, num_heads_, hd});
     auto gate = mx::slice(q_proj_out, {0, 0, 0, hd}, {B, L, num_heads_, 2 * hd});
@@ -325,29 +130,34 @@ mx::array Qwen3NextAttention::operator()(const mx::array& x,
     auto keys = linear_fwd(x, k_proj_weight_, k_proj_bias_);
     auto values = linear_fwd(x, v_proj_weight_, v_proj_bias_);
 
-    queries = mx::transpose(mx::fast::rms_norm(queries, q_norm_weight_, rms_norm_eps_), {0, 2, 1, 3});
-    keys = mx::transpose(mx::fast::rms_norm(mx::reshape(keys, {B, L, num_kv_heads_, -1}), k_norm_weight_, rms_norm_eps_), {0, 2, 1, 3});
+    // Swift: rmsNorm on queries and keys with learned weights
+    queries = mx::transpose(
+        mx::fast::rms_norm(queries, q_norm_weight_, rms_norm_eps_),
+        {0, 2, 1, 3});
+    keys = mx::transpose(
+        mx::fast::rms_norm(mx::reshape(keys, {B, L, num_kv_heads_, -1}), k_norm_weight_, rms_norm_eps_),
+        {0, 2, 1, 3});
     values = mx::transpose(mx::reshape(values, {B, L, num_kv_heads_, -1}), {0, 2, 1, 3});
 
+    // RoPE
     int offset = cache ? cache->offset() : 0;
     queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
     keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
 
+    // KV cache update
     if (cache) {
         auto [k, v] = cache->update(keys, values);
-        keys = k; values = v;
+        keys = k;
+        values = v;
     }
 
+    // SDPA
     auto output = sdpa(queries, keys, values, scale_, mask);
     output = mx::reshape(mx::transpose(output, {0, 2, 1, 3}), {B, L, -1});
 
-    // Apply sigmoid gate: output * sigmoid(gate) — compiled to fuse multiply+sigmoid
-    static auto compiled_gate = mx::compile(
-        [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-            return {mx::multiply(inputs[0], mx::sigmoid(inputs[1]))};
-        },
-        /*shapeless=*/true);
-    output = compiled_gate({output, gate})[0];
+    // Swift: oProj(sigmoidMultiply(output, gate))
+    // sigmoidMultiply = output * sigmoid(gate)
+    output = mx::multiply(output, mx::sigmoid(gate));
     return linear_fwd(output, o_proj_weight_, o_proj_bias_);
 }
 
@@ -370,6 +180,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextAttention::weight_map() {
 }
 
 // --- Qwen3NextGatedDeltaNet ---
+// Swift: Qwen3NextGatedDeltaNet -- linear attention for most layers
 
 Qwen3NextGatedDeltaNet::Qwen3NextGatedDeltaNet(const Qwen3NextConfiguration& args)
     : hidden_size_(args.hidden_size),
@@ -389,6 +200,16 @@ Qwen3NextGatedDeltaNet::Qwen3NextGatedDeltaNet(const Qwen3NextConfiguration& arg
       norm_(args.linear_value_head_dim, args.rms_norm_eps),
       out_proj_weight_(mx::zeros({args.hidden_size, value_dim_}))
 {}
+
+// Swift: createSSMMask -- returns nil when cache has conv_state (cache[0] != nil)
+static std::optional<mx::array> create_ssm_mask(int B, int S, MambaCache* cache) {
+    if (cache && (*cache)[0].has_value()) {
+        // Swift returns nil when conv_state exists (decode mode)
+        return std::nullopt;
+    }
+    // Prefill: all tokens valid
+    return mx::ones({B, S});
+}
 
 mx::array Qwen3NextGatedDeltaNet::operator()(
     const mx::array& inputs,
@@ -410,12 +231,20 @@ mx::array Qwen3NextGatedDeltaNet::operator()(
     // Split qkvz: [q(dn), k(dn), v(vheads_per_k*dv), z(vheads_per_k*dv)]
     auto q = mx::slice(qkvz, {0, 0, 0, 0}, {B, S, nk, dn});
     auto k = mx::slice(qkvz, {0, 0, 0, dn}, {B, S, nk, 2 * dn});
-    auto v = mx::reshape(mx::slice(qkvz, {0, 0, 0, 2 * dn}, {B, S, nk, 2 * dn + v_heads_per_k * dv}), {B, S, -1, dv});
-    auto z = mx::reshape(mx::slice(qkvz, {0, 0, 0, 2 * dn + v_heads_per_k * dv}, {B, S, nk, qkvz.shape(3)}), {B, S, -1, dv});
+    auto v = mx::reshape(
+        mx::slice(qkvz, {0, 0, 0, 2 * dn}, {B, S, nk, 2 * dn + v_heads_per_k * dv}),
+        {B, S, -1, dv});
+    auto z = mx::reshape(
+        mx::slice(qkvz, {0, 0, 0, 2 * dn + v_heads_per_k * dv}, {B, S, nk, qkvz.shape(3)}),
+        {B, S, -1, dv});
 
     // Split ba: [b(vheads_per_k), a(remaining)]
-    auto b_val = mx::reshape(mx::slice(ba, {0, 0, 0, 0}, {B, S, nk, v_heads_per_k}), {B, S, nv});
-    auto a_val = mx::reshape(mx::slice(ba, {0, 0, 0, v_heads_per_k}, {B, S, nk, ba.shape(3)}), {B, S, nv});
+    auto b_val = mx::reshape(
+        mx::slice(ba, {0, 0, 0, 0}, {B, S, nk, v_heads_per_k}),
+        {B, S, nv});
+    auto a_val = mx::reshape(
+        mx::slice(ba, {0, 0, 0, v_heads_per_k}, {B, S, nk, ba.shape(3)}),
+        {B, S, nv});
 
     // Conv1d processing
     auto dtype = inputs.dtype();
@@ -438,49 +267,41 @@ mx::array Qwen3NextGatedDeltaNet::operator()(
 
     auto conv_input = mx::concatenate({conv_state, mixed_qkv}, 1);
 
+    // Save conv state for next step
     if (cache) {
-        // Save last (conv_kernel_size_ - 1) steps
         int start = conv_input.shape(1) - (conv_kernel_size_ - 1);
         (*cache)[0] = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
     }
 
-    // For T=1 decode, replace conv1d with a simple element-wise dot product.
-    // conv_input is [B, kernel_size, C] and weight is [C, 1, kernel_size].
-    // Each channel c: output[c] = sum_k(input[k, c] * weight[c, 0, k])
-    // Apply depthwise conv1d + silu.
-    // For T=1 decode, conv_input is [B, K, C] where K=conv_kernel_size.
-    // Replace conv1d with a compiled element-wise dot product to avoid conv overhead.
-    // Weight is [C, K, 1] (MLX format: [C_out, K, C_in/groups]).
-    mx::array conv_out(0.0f);
-    if (S == 1 && conv_input.shape(1) == conv_kernel_size_) {
-        // weight: [C, K, 1] → squeeze last → [C, K] → transpose → [K, C] → [1, K, C]
-        auto w = mx::reshape(
-            mx::transpose(mx::reshape(conv1d_weight_, {conv_dim_, conv_kernel_size_})),
-            {1, conv_kernel_size_, conv_dim_});
-        // [B, K, C] * [1, K, C] → sum over K → [B, 1, C], then silu
-        static auto compiled_conv_silu = mx::compile(
-            [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-                auto dot = mx::sum(mx::multiply(inputs[0], inputs[1]), 1, true);
-                return {mx::multiply(dot, mx::sigmoid(dot))}; // silu
-            },
-            /*shapeless=*/true);
-        conv_out = compiled_conv_silu({conv_input, w})[0];
-    } else {
-        conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
-        conv_out = silu(conv_out);
-    }
+    // Swift: silu(conv1d(convInput)) -- no special T=1 decode path
+    auto conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
+    conv_out = silu(conv_out);
 
     // Split conv output into q, k, v
-    auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, S, key_dim_}), {B, S, num_k_heads_, head_k_dim_});
-    auto k_out = mx::reshape(mx::slice(conv_out, {0, 0, key_dim_}, {B, S, 2 * key_dim_}), {B, S, num_k_heads_, head_k_dim_});
-    auto v_out = mx::reshape(mx::slice(conv_out, {0, 0, 2 * key_dim_}, {B, S, conv_dim_}), {B, S, num_v_heads_, head_v_dim_});
+    auto q_out = mx::reshape(
+        mx::slice(conv_out, {0, 0, 0}, {B, S, key_dim_}),
+        {B, S, num_k_heads_, head_k_dim_});
+    auto k_out = mx::reshape(
+        mx::slice(conv_out, {0, 0, key_dim_}, {B, S, 2 * key_dim_}),
+        {B, S, num_k_heads_, head_k_dim_});
+    auto v_out = mx::reshape(
+        mx::slice(conv_out, {0, 0, 2 * key_dim_}, {B, S, conv_dim_}),
+        {B, S, num_v_heads_, head_v_dim_});
 
-    // Apply RMS norm scaling to q and k (use weight vectors to avoid separate multiply)
-    float inv_scale = std::pow(static_cast<float>(head_k_dim_), -0.5f);
-    auto q_norm_w = mx::full({head_k_dim_}, inv_scale * inv_scale, q_out.dtype());
-    auto k_norm_w = mx::full({head_k_dim_}, inv_scale, k_out.dtype());
-    q_out = mx::fast::rms_norm(q_out, q_norm_w, 1e-6f);
-    k_out = mx::fast::rms_norm(k_out, k_norm_w, 1e-6f);
+    // Swift Q/K norms: rmsNorm without weight (mlxNone), then multiply by scalar.
+    // rmsNorm(x, weight: mlxNone, eps: 1e-6) = x / sqrt(mean(x^2) + eps)
+    // Then: q = normed * (head_k_dim ** -0.5)
+    //        k = normed (no scalar, just the norm)
+    float q_scale = std::pow(static_cast<float>(head_k_dim_), -0.5f);
+
+    // Manual rms_norm without weight: x * rsqrt(mean(x^2, axis=-1, keepdims=true) + eps)
+    auto q_normed = mx::multiply(q_out,
+        mx::rsqrt(mx::add(mx::mean(mx::square(q_out), -1, true), mx::array(1e-6f))));
+    q_out = mx::multiply(q_normed, mx::array(q_scale));
+
+    auto k_normed = mx::multiply(k_out,
+        mx::rsqrt(mx::add(mx::mean(mx::square(k_out), -1, true), mx::array(1e-6f))));
+    k_out = k_normed;
 
     // Gated delta update
     std::optional<mx::array> ssm_state;
@@ -495,9 +316,10 @@ mx::array Qwen3NextGatedDeltaNet::operator()(
         (*cache)[1] = new_state;
     }
 
-    // Apply gated norm
+    // Apply gated norm: norm(out, gate=z)
     auto normalized = norm_(out, z);
-    return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+    auto final_out = linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+    return final_out;
 }
 
 std::unordered_map<std::string, mx::array*> Qwen3NextGatedDeltaNet::weight_map() {
@@ -513,6 +335,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextGatedDeltaNet::weight_map()
 }
 
 // --- Qwen3NextMLP ---
+// Swift: Qwen3NextMLP -- dense MLP
 
 Qwen3NextMLP::Qwen3NextMLP(int dimensions, int hidden_dimensions)
     : gate_proj_weight_(mx::zeros({hidden_dimensions, dimensions})),
@@ -534,6 +357,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextMLP::weight_map() {
 }
 
 // --- Qwen3NextSparseMoeBlock ---
+// Swift: Qwen3NextSparseMoeBlock -- Sparse MoE with shared expert
 
 Qwen3NextSparseMoeBlock::Qwen3NextSparseMoeBlock(const Qwen3NextConfiguration& args)
     : norm_topk_prob_(args.norm_topk_prob),
@@ -561,16 +385,11 @@ mx::array Qwen3NextSparseMoeBlock::operator()(const mx::array& x) {
     auto y = switch_mlp_(x, inds);
     auto combined = mx::sum(mx::multiply(y, mx::expand_dims(scores, -1)), -2);
 
-    // Shared expert with compiled gating: sigmoid(gate) * y + combined
+    // Shared expert with gating: sigmoid(gate) * shared_y + combined
     auto shared_y = shared_expert_(x);
-    static auto compiled_shared_gate = mx::compile(
-        [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-            auto gated = mx::multiply(mx::sigmoid(inputs[0]), inputs[1]);
-            return {mx::add(inputs[2], gated)};
-        },
-        /*shapeless=*/true);
     auto gate_out = linear_fwd(x, shared_expert_gate_weight_);
-    return compiled_shared_gate({gate_out, shared_y, combined})[0];
+    auto gated = mx::multiply(mx::sigmoid(gate_out), shared_y);
+    return mx::add(combined, gated);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen3NextSparseMoeBlock::weight_map() {
@@ -583,6 +402,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextSparseMoeBlock::weight_map(
 }
 
 // --- Qwen3NextDecoderLayer ---
+// Swift: Qwen3NextDecoderLayer -- either linear attn or standard attn, with MLP or MoE
 
 Qwen3NextDecoderLayer::Qwen3NextDecoderLayer(const Qwen3NextConfiguration& args, int layer_idx)
     : is_linear_((layer_idx + 1) % args.full_attention_interval != 0),
@@ -653,6 +473,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextDecoderLayer::weight_map() 
 }
 
 // --- Qwen3NextModelInner ---
+// Swift: Qwen3NextModelInner
 
 Qwen3NextModelInner::Qwen3NextModelInner(const Qwen3NextConfiguration& args)
     : embed_tokens_weight_(mx::zeros({args.vocab_size, args.hidden_size})),
@@ -672,35 +493,27 @@ mx::array Qwen3NextModelInner::operator()(const mx::array& inputs, std::vector<K
     int fa_idx = full_attention_interval_ - 1;
     if (fa_idx >= static_cast<int>(layers_.size())) fa_idx = 0;
 
-    auto fa_mask = create_attention_mask(h, cache && fa_idx < static_cast<int>(cache->size()) ? &(*cache)[fa_idx] : nullptr);
+    auto fa_mask = create_attention_mask(
+        h, cache && fa_idx < static_cast<int>(cache->size()) ? &(*cache)[fa_idx] : nullptr);
 
-    // SSM mask: for linear attention layers, create a simple boolean mask
-    // based on whether there's a conv_state cached (i.e. offset > 0)
+    // SSM mask: return nil (nullopt) when cache has conv_state, ones otherwise.
+    // Find first linear layer to check its cache state.
     std::optional<mx::array> ssm_mask;
-    // Find first linear layer index for SSM mask
     for (size_t i = 0; i < layers_.size(); ++i) {
         if (layers_[i].is_linear()) {
-            // Create SSM mask: all ones (all tokens are valid)
-            int seq_len = h.shape(1);
-            ssm_mask = mx::ones({h.shape(0), seq_len});
+            MambaCache* mamba = nullptr;
+            if (cache && i < cache->size()) {
+                mamba = (*cache)[i].as_mamba();
+            }
+            ssm_mask = create_ssm_mask(h.shape(0), h.shape(1), mamba);
             break;
         }
     }
 
-    static bool debug = std::getenv("MLX_DEBUG_LAYERS") != nullptr;
     for (size_t i = 0; i < layers_.size(); ++i) {
         KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
         auto attn_mask = layers_[i].is_linear() ? AttentionMask{} : fa_mask;
         h = layers_[i](h, attn_mask, ssm_mask, lc);
-        if (debug && (i < 4 || i >= layers_.size() - 2)) {
-            auto f = mx::astype(mx::reshape(h, {-1}), mx::float32);
-            auto m = mx::mean(f); auto v = mx::var(f);
-            auto mn = mx::min(f); auto mx_ = mx::max(f);
-            mx::eval({m, v, mn, mx_});
-            std::cerr << "  L" << i << (layers_[i].is_linear() ? "(GDN)" : "(ATN)")
-                      << ": mean=" << m.item<float>() << " std=" << std::sqrt(v.item<float>())
-                      << " min=" << mn.item<float>() << " max=" << mx_.item<float>() << std::endl;
-        }
     }
 
     return mx::fast::rms_norm(h, norm_weight_, rms_norm_eps_);
@@ -722,6 +535,7 @@ std::unordered_map<std::string, mx::array*> Qwen3NextModelInner::weight_map() {
 }
 
 // --- Qwen3NextModel ---
+// Swift: Qwen3NextModel
 
 Qwen3NextModel::Qwen3NextModel(const Qwen3NextConfiguration& args)
     : config_(args), model_(args)
@@ -773,16 +587,13 @@ Qwen3NextModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
     }
 
     // Stack per-expert weights (and their scales/biases) into SwitchGLU format.
-    // The individual expert weights are stacked along axis 0 to create
-    // [E, N, K] shaped tensors. Scales and biases must also be stacked so that
-    // register_quantized_weights can associate them with the stacked weight.
+    // Early return when no experts need stacking.
     if (weights.find("model.layers.0.mlp.experts.0.up_proj.weight") == weights.end()) {
-        // No expert stacking needed — apply norm + conv1d fixups only
+        // No expert stacking needed -- fall through to norm + conv1d fixups
     } else {
         for (int l = 0; l < config_.num_hidden_layers; ++l) {
             std::string prefix = "model.layers." + std::to_string(l) + ".mlp.";
             for (const auto& n : {"up_proj", "down_proj", "gate_proj"}) {
-                // Stack weights
                 std::string key0 = prefix + "experts.0." + n + ".weight";
                 if (weights.find(key0) == weights.end()) continue;
 
@@ -825,9 +636,9 @@ Qwen3NextModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
         }
     }
 
-    // Fix conv1d weight ordering and add 1.0 to norm weights
+    // Fix conv1d weight ordering and add 1.0 to norm weights.
     // Only regular RMSNorm weights use (1+weight) and need +1 here.
-    // GatedRMSNorm (.linear_attn.norm.weight) uses weight directly — do NOT add +1.
+    // GatedRMSNorm (.linear_attn.norm.weight) uses weight directly -- do NOT add +1.
     std::vector<std::string> norm_suffixes = {
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",

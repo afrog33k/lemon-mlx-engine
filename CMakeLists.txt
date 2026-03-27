@@ -101,6 +101,7 @@ add_library(mlx-lm-common
     src/common/tokenizer.cpp
     src/common/quantize_utils.cpp
     src/common/chat_template.cpp
+    src/common/gated_delta.cpp
 )
 target_link_libraries(mlx-lm-common PUBLIC
     mlx-lm-core

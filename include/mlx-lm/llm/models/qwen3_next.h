@@ -9,6 +9,7 @@
 #include <mlx-lm/common/types.h>
 #include <mlx-lm/llm/llm_model.h>
 #include <mlx/mlx.h>
+#include <mlx-lm/common/gated_delta.h>
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <optional>
@@ -53,33 +54,6 @@ struct Qwen3NextConfiguration {
 };
 
 void from_json(const nlohmann::json& j, Qwen3NextConfiguration& c);
-
-// Gated Delta Net helper functions
-mlx::core::array compute_gated_delta_g(
-    const mlx::core::array& a_log,
-    const mlx::core::array& a,
-    const mlx::core::array& dt_bias);
-
-std::pair<mlx::core::array, mlx::core::array> gated_delta_step_ops(
-    const mlx::core::array& q, const mlx::core::array& k,
-    const mlx::core::array& v, const mlx::core::array& g,
-    const mlx::core::array& beta, const mlx::core::array& state,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
-
-std::pair<mlx::core::array, mlx::core::array> gated_delta_ops(
-    const mlx::core::array& q, const mlx::core::array& k,
-    const mlx::core::array& v, const mlx::core::array& g,
-    const mlx::core::array& beta,
-    const std::optional<mlx::core::array>& state = std::nullopt,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
-
-std::pair<mlx::core::array, mlx::core::array> gated_delta_update(
-    const mlx::core::array& q, const mlx::core::array& k,
-    const mlx::core::array& v, const mlx::core::array& a,
-    const mlx::core::array& b, const mlx::core::array& a_log,
-    const mlx::core::array& dt_bias,
-    const std::optional<mlx::core::array>& state = std::nullopt,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
 
 // RMSNorm with optional gating
 class Qwen3NextRMSNormGated {
