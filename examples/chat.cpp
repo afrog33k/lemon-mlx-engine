@@ -32,6 +32,8 @@ struct CliArgs {
     size_t memory_limit_mb = 0;
     bool no_think = false;
     bool raw_mode = false;  // Skip chat template, use raw encoding
+    int kv_bits = 0;        // KV cache quantization bits (0=off, 4 or 8)
+    int kv_group_size = 64; // KV cache quantization group size
 };
 
 static CliArgs parse_args(int argc, char* argv[]) {
@@ -45,7 +47,9 @@ static CliArgs parse_args(int argc, char* argv[]) {
                   << "  --repetition-penalty F  Repetition penalty (default: off)\n"
                   << "  --memory-limit MB       GPU wired memory limit\n"
                   << "  --no-think              Disable thinking/reasoning (Qwen3)\n"
-                  << "  --raw                   Skip chat template, raw encoding\n";
+                  << "  --raw                   Skip chat template, raw encoding\n"
+                  << "  --kv-bits N             KV cache quantization (0=off, 4 or 8)\n"
+                  << "  --kv-group-size N       KV cache quant group size (default: 64)\n";
         std::exit(1);
     }
     args.model_path = argv[1];
@@ -67,6 +71,10 @@ static CliArgs parse_args(int argc, char* argv[]) {
             args.no_think = true;
         } else if (flag == "--raw") {
             args.raw_mode = true;
+        } else if (flag == "--kv-bits" && i + 1 < argc) {
+            args.kv_bits = std::stoi(argv[++i]);
+        } else if (flag == "--kv-group-size" && i + 1 < argc) {
+            args.kv_group_size = std::stoi(argv[++i]);
         }
     }
     return args;
@@ -112,6 +120,10 @@ int main(int argc, char* argv[]) {
         params.max_tokens = args.max_tokens;
         if (args.repetition_penalty > 0.0f) {
             params.repetition_penalty = args.repetition_penalty;
+        }
+        if (args.kv_bits > 0) {
+            params.kv_bits = args.kv_bits;
+            params.kv_group_size = args.kv_group_size;
         }
 
         // Use ChatSession if chat template is available and not in raw mode.

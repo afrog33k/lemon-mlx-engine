@@ -125,6 +125,7 @@ add_library(mlx-lm-llm
     src/llm/models/starcoder2.cpp
     src/llm/models/qwen3_moe.cpp
     src/llm/models/qwen3_next.cpp
+    src/llm/models/qwen35_moe.cpp
     src/llm/models/mistral3_text.cpp
     src/llm/models/deepseek_v3.cpp
     src/llm/models/mimo.cpp

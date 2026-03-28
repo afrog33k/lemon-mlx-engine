@@ -12,6 +12,7 @@
 #include <mlx-lm/llm/models/starcoder2.h>
 #include <mlx-lm/llm/models/qwen3_moe.h>
 #include <mlx-lm/llm/models/qwen3_next.h>
+#include <mlx-lm/llm/models/qwen35_moe.h>
 #include <mlx-lm/llm/models/mistral3_text.h>
 #include <mlx-lm/llm/models/deepseek_v3.h>
 #include <mlx-lm/llm/models/mimo.h>
@@ -119,6 +120,8 @@ static std::unordered_map<std::string, LLMLoaderFn>& llm_loaders() {
         {"starcoder2",  load_typed_model<Starcoder2Configuration, Starcoder2Model>},
         {"qwen3_moe",   load_typed_model<Qwen3MoEConfiguration, Qwen3MoEModel>},
         {"qwen3_next",  load_typed_model<Qwen3NextConfiguration, Qwen3NextModel>},
+        {"qwen3_5",     load_typed_model<Qwen35MoEConfiguration, Qwen35MoEModel>},
+        {"qwen3_5_moe", load_typed_model<Qwen35MoEConfiguration, Qwen35MoEModel>},
         {"mistral3",    load_typed_model<Mistral3TextConfiguration, Mistral3TextModel>},
         {"ministral3",  load_typed_model<Mistral3TextConfiguration, Mistral3TextModel>},
         {"deepseek_v3", load_typed_model<DeepseekV3Configuration, DeepseekV3Model>},
@@ -175,6 +178,8 @@ ModelTypeRegistry& llm_type_registry() {
         {"starcoder2",  create_model<Starcoder2Configuration, Starcoder2Model>},
         {"qwen3_moe",   create_model<Qwen3MoEConfiguration, Qwen3MoEModel>},
         {"qwen3_next",  create_model<Qwen3NextConfiguration, Qwen3NextModel>},
+        {"qwen3_5",     create_model<Qwen35MoEConfiguration, Qwen35MoEModel>},
+        {"qwen3_5_moe", create_model<Qwen35MoEConfiguration, Qwen35MoEModel>},
         {"mistral3",    create_model<Mistral3TextConfiguration, Mistral3TextModel>},
         {"ministral3",  create_model<Mistral3TextConfiguration, Mistral3TextModel>},
         {"deepseek_v3", create_model<DeepseekV3Configuration, DeepseekV3Model>},
