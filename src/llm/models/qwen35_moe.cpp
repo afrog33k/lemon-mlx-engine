@@ -21,41 +21,44 @@ namespace mlx_lm {
 // --- Configuration ---
 
 void from_json(const nlohmann::json& j, Qwen35MoEConfiguration& c) {
-    c.hidden_size = j.at("hidden_size").get<int>();
-    c.num_hidden_layers = j.at("num_hidden_layers").get<int>();
-    c.intermediate_size = j.at("intermediate_size").get<int>();
-    c.num_attention_heads = j.at("num_attention_heads").get<int>();
-    c.num_key_value_heads = j.at("num_key_value_heads").get<int>();
-    c.linear_num_value_heads = j.at("linear_num_value_heads").get<int>();
-    c.linear_num_key_heads = j.at("linear_num_key_heads").get<int>();
-    c.linear_key_head_dim = j.at("linear_key_head_dim").get<int>();
-    c.linear_value_head_dim = j.at("linear_value_head_dim").get<int>();
-    c.linear_conv_kernel_dim = j.at("linear_conv_kernel_dim").get<int>();
-    c.rms_norm_eps = j.at("rms_norm_eps").get<float>();
-    c.vocab_size = j.at("vocab_size").get<int>();
-    c.rope_theta = j.value("rope_theta", 100000.0f);
-    c.partial_rotary_factor = j.value("partial_rotary_factor", 0.25f);
-    c.max_position_embeddings = j.value("max_position_embeddings", 131072);
-    c.tie_word_embeddings = j.value("tie_word_embeddings", false);
-    c.attention_bias = j.value("attention_bias", false);
-    c.full_attention_interval = j.value("full_attention_interval", 4);
-    c.norm_topk_prob = j.value("norm_topk_prob", true);
+    // VLM models nest the text config under "text_config"
+    const auto& cfg = j.contains("text_config") ? j.at("text_config") : j;
+    // All fields use value() with defaults matching Swift's decodeIfPresent
+    c.hidden_size = cfg.value("hidden_size", 4096);
+    c.num_hidden_layers = cfg.value("num_hidden_layers", 32);
+    c.intermediate_size = cfg.value("intermediate_size", 14336);
+    c.num_attention_heads = cfg.value("num_attention_heads", 32);
+    c.num_key_value_heads = cfg.value("num_key_value_heads", 8);
+    c.linear_num_value_heads = cfg.value("linear_num_value_heads", 64);
+    c.linear_num_key_heads = cfg.value("linear_num_key_heads", 16);
+    c.linear_key_head_dim = cfg.value("linear_key_head_dim", 192);
+    c.linear_value_head_dim = cfg.value("linear_value_head_dim", 128);
+    c.linear_conv_kernel_dim = cfg.value("linear_conv_kernel_dim", 4);
+    c.rms_norm_eps = cfg.value("rms_norm_eps", 1e-6f);
+    c.vocab_size = cfg.value("vocab_size", 151936);
+    c.rope_theta = cfg.value("rope_theta", 100000.0f);
+    c.partial_rotary_factor = cfg.value("partial_rotary_factor", 0.25f);
+    c.max_position_embeddings = cfg.value("max_position_embeddings", 131072);
+    c.tie_word_embeddings = cfg.value("tie_word_embeddings", false);
+    c.attention_bias = cfg.value("attention_bias", false);
+    c.full_attention_interval = cfg.value("full_attention_interval", 4);
+    c.norm_topk_prob = cfg.value("norm_topk_prob", true);
 
     // MoE fields (may be absent for pure text model)
-    c.num_experts = j.value("num_experts", 0);
-    c.num_experts_per_tok = j.value("num_experts_per_tok", 0);
-    c.decoder_sparse_step = j.value("decoder_sparse_step", 1);
-    c.shared_expert_intermediate_size = j.value("shared_expert_intermediate_size", 0);
-    c.moe_intermediate_size = j.value("moe_intermediate_size", 0);
+    c.num_experts = cfg.value("num_experts", 0);
+    c.num_experts_per_tok = cfg.value("num_experts_per_tok", 0);
+    c.decoder_sparse_step = cfg.value("decoder_sparse_step", 1);
+    c.shared_expert_intermediate_size = cfg.value("shared_expert_intermediate_size", 0);
+    c.moe_intermediate_size = cfg.value("moe_intermediate_size", 0);
 
-    if (j.contains("head_dim") && !j["head_dim"].is_null()) {
-        c.head_dim = j["head_dim"].get<int>();
+    if (cfg.contains("head_dim") && !cfg.at("head_dim").is_null()) {
+        c.head_dim = cfg.at("head_dim").get<int>();
     }
 
     // Parse rope_scaling: check rope_parameters first (Qwen3.5 style),
     // then fall back to rope_scaling
-    if (j.contains("rope_parameters") && !j["rope_parameters"].is_null()) {
-        auto& rp = j["rope_parameters"];
+    if (cfg.contains("rope_parameters") && !cfg.at("rope_parameters").is_null()) {
+        auto& rp = cfg.at("rope_parameters");
         std::unordered_map<std::string, StringOrNumber> scaling;
         for (auto& [key, val] : rp.items()) {
             StringOrNumber sn;
@@ -77,9 +80,9 @@ void from_json(const nlohmann::json& j, Qwen35MoEConfiguration& c) {
             c.partial_rotary_factor = prf_it->second.as_float();
         }
         c.rope_scaling = scaling;
-    } else if (j.contains("rope_scaling") && !j["rope_scaling"].is_null()) {
+    } else if (cfg.contains("rope_scaling") && !cfg.at("rope_scaling").is_null()) {
         std::unordered_map<std::string, StringOrNumber> scaling;
-        for (auto& [key, val] : j["rope_scaling"].items()) {
+        for (auto& [key, val] : cfg.at("rope_scaling").items()) {
             StringOrNumber sn;
             from_json(val, sn);
             scaling[key] = sn;
@@ -653,9 +656,9 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
         }
 
         std::string new_key = key;
-        // "model.language_model.X" -> "model.X"
-        if (new_key.find("model.language_model") == 0) {
-            new_key = "model" + new_key.substr(std::string("model.language_model").size());
+        // "language_model.model.X" -> "model.X" (VLM wrapper prefix)
+        if (new_key.find("language_model.model.") == 0) {
+            new_key = "model." + new_key.substr(std::string("language_model.model.").size());
         }
         // Keys without "model." prefix get it added
         // (but don't double-prefix keys that already have it)
@@ -733,12 +736,21 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
                 }
 
                 std::string dst = prefix + "switch_mlp." + n;
-                weights.insert_or_assign(dst + ".weight", mx::stack(w_join));
+                auto stacked_w = mx::stack(w_join);
+                w_join.clear();  // Release references to individual expert arrays
+                mx::eval(stacked_w);
+                weights.insert_or_assign(dst + ".weight", std::move(stacked_w));
                 if (!s_join.empty()) {
-                    weights.insert_or_assign(dst + ".scales", mx::stack(s_join));
+                    auto stacked_s = mx::stack(s_join);
+                    s_join.clear();
+                    mx::eval(stacked_s);
+                    weights.insert_or_assign(dst + ".scales", std::move(stacked_s));
                 }
                 if (has_biases && !b_join.empty()) {
-                    weights.insert_or_assign(dst + ".biases", mx::stack(b_join));
+                    auto stacked_b = mx::stack(b_join);
+                    b_join.clear();
+                    mx::eval(stacked_b);
+                    weights.insert_or_assign(dst + ".biases", std::move(stacked_b));
                 }
             }
         }
