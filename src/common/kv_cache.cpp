@@ -40,17 +40,67 @@ KVCacheSimple::update_impl(
     const mlx::core::array& new_keys,
     const mlx::core::array& new_values)
 {
+    int n_new = new_keys.shape(2);
 
-    if (keys_.has_value()) {
-        keys_ = mx::concatenate({keys_.value(), new_keys}, 2);
-        values_ = mx::concatenate({values_.value(), new_values}, 2);
-    } else {
-        keys_ = new_keys;
-        values_ = new_values;
+    if (!keys_.has_value()) {
+        // Pre-allocate to avoid per-token reallocation via concatenate.
+        // Allocate 256 slots (default 256) upfront, grow by 2x when full.
+        int B = new_keys.shape(0);
+        int H = new_keys.shape(1);
+        int D = new_keys.shape(3);
+        int alloc_len = std::max(n_new, 256);
+
+        keys_ = mx::zeros({B, H, alloc_len, D}, new_keys.dtype());
+        values_ = mx::zeros({B, H, alloc_len, D}, new_values.dtype());
+
+        keys_ = mx::slice_update(keys_.value(), new_keys,
+            mx::Shape{0, 0, 0, 0}, mx::Shape{B, H, n_new, D});
+        values_ = mx::slice_update(values_.value(), new_values,
+            mx::Shape{0, 0, 0, 0}, mx::Shape{B, H, n_new, D});
+
+        offset_ = n_new;
+        return {mx::slice(keys_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,n_new,D}),
+                mx::slice(values_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,n_new,D})};
     }
 
-    offset_ += new_keys.shape(2);
-    return {keys_.value(), values_.value()};
+    int B = keys_.value().shape(0);
+    int H = keys_.value().shape(1);
+    int D = keys_.value().shape(3);
+    int current_alloc = keys_.value().shape(2);
+
+    if (offset_ + n_new <= current_alloc) {
+        // Fast path: in-place update, zero allocations.
+        keys_ = mx::slice_update(keys_.value(), new_keys,
+            mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
+        values_ = mx::slice_update(values_.value(), new_values,
+            mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
+        offset_ += n_new;
+        return {mx::slice(keys_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D}),
+                mx::slice(values_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D})};
+    }
+
+    // Grow by 2x (amortized O(1))
+    int new_alloc = std::max(current_alloc * 2, offset_ + n_new);
+    auto new_k = mx::zeros({B, H, new_alloc, D}, keys_.value().dtype());
+    auto new_v = mx::zeros({B, H, new_alloc, D}, values_.value().dtype());
+
+    new_k = mx::slice_update(new_k,
+        mx::slice(keys_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D}),
+        mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D});
+    new_v = mx::slice_update(new_v,
+        mx::slice(values_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D}),
+        mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D});
+
+    new_k = mx::slice_update(new_k, new_keys,
+        mx::Shape{0,0,offset_,0}, mx::Shape{B,H,offset_+n_new,D});
+    new_v = mx::slice_update(new_v, new_values,
+        mx::Shape{0,0,offset_,0}, mx::Shape{B,H,offset_+n_new,D});
+
+    keys_ = new_k;
+    values_ = new_v;
+    offset_ += n_new;
+    return {mx::slice(keys_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D}),
+            mx::slice(values_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D})};
 }
 
 int KVCacheSimple::trim_impl(int n) {
@@ -64,10 +114,10 @@ int KVCacheSimple::trim_impl(int n) {
         keys_ = std::nullopt;
         values_ = std::nullopt;
     } else {
-        keys_ = mx::slice(keys_.value(), {0, 0, 0, 0},
+        keys_ = mx::slice(keys_.value(), mx::Shape{0, 0, 0, 0},
                            {keys_.value().shape(0), keys_.value().shape(1),
                             seq_len - to_trim, keys_.value().shape(3)});
-        values_ = mx::slice(values_.value(), {0, 0, 0, 0},
+        values_ = mx::slice(values_.value(), mx::Shape{0, 0, 0, 0},
                              {values_.value().shape(0), values_.value().shape(1),
                               seq_len - to_trim, values_.value().shape(3)});
     }
@@ -112,13 +162,13 @@ RotatingKVCache::update_impl(
             int excess = total - max_size_;
             // Keep the first keep_ entries, drop excess from after keep_
             if (excess > 0 && keep_ < total) {
-                auto prefix_k = mx::slice(keys_.value(), {0, 0, 0, 0},
+                auto prefix_k = mx::slice(keys_.value(), mx::Shape{0, 0, 0, 0},
                     {keys_.value().shape(0), keys_.value().shape(1), keep_, keys_.value().shape(3)});
                 auto suffix_k = mx::slice(keys_.value(), {0, 0, keep_ + excess, 0},
                     {keys_.value().shape(0), keys_.value().shape(1), total, keys_.value().shape(3)});
                 keys_ = mx::concatenate({prefix_k, suffix_k}, 2);
 
-                auto prefix_v = mx::slice(values_.value(), {0, 0, 0, 0},
+                auto prefix_v = mx::slice(values_.value(), mx::Shape{0, 0, 0, 0},
                     {values_.value().shape(0), values_.value().shape(1), keep_, values_.value().shape(3)});
                 auto suffix_v = mx::slice(values_.value(), {0, 0, keep_ + excess, 0},
                     {values_.value().shape(0), values_.value().shape(1), total, values_.value().shape(3)});
