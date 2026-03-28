@@ -44,6 +44,10 @@ void from_json(const nlohmann::json& j, Qwen35MoEConfiguration& c) {
     c.full_attention_interval = cfg.value("full_attention_interval", 4);
     c.norm_topk_prob = cfg.value("norm_topk_prob", true);
 
+    if (cfg.contains("head_dim") && !cfg.at("head_dim").is_null()) {
+        c.head_dim = cfg.at("head_dim").get<int>();
+    }
+
     // MoE fields (may be absent for pure text model)
     c.num_experts = cfg.value("num_experts", 0);
     c.num_experts_per_tok = cfg.value("num_experts_per_tok", 0);
@@ -765,19 +769,10 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
 
 void Qwen35MoEModel::load_weights(const std::unordered_map<std::string, mx::array>& weights) {
     auto wmap = weight_map();
-    int loaded = 0, missing = 0;
     for (auto& [name, target] : wmap) {
         auto it = weights.find(name);
-        if (it != weights.end()) {
-            *target = it->second;
-            loaded++;
-        } else {
-            if (missing < 10) fprintf(stderr, "  MISSING: %s\n", name.c_str());
-            missing++;
-        }
+        if (it != weights.end()) *target = it->second;
     }
-    fprintf(stderr, "[Qwen35MoE] Loaded %d/%d weights (%d missing)\n",
-            loaded, loaded + missing, missing);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEModel::weight_map() {
