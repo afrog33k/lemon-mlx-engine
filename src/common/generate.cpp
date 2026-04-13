@@ -10,7 +10,8 @@
 #include <iostream>
 
 // Forward declarations for ROCm arena/graph support.
-// Avoids pulling in HIP headers into regular C++ code.
+// These symbols only exist in the ROCm build of MLX.
+#if defined(MLX_BUILD_ROCM)
 namespace mlx::core {
   bool gpu_arena_begin(size_t capacity);
   void gpu_arena_reset();
@@ -23,6 +24,7 @@ namespace mlx::core {
   void gpu_graph_reset();
   bool gpu_graph_available();
 }
+#endif
 
 namespace mlx_lm {
 
@@ -304,9 +306,10 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
 
     auto batched = add_batch_dim(previous);
 
-    // --- HIP Graph capture state machine ---
+    // --- HIP Graph capture state machine (ROCm only) ---
     // After warmup tokens, capture the decode step as a HIP graph for
     // single-dispatch replay. Uses arena allocator for deterministic addresses.
+#if defined(MLX_BUILD_ROCM)
     namespace gpu = mlx::core;
 
     switch (graph_state_) {
@@ -358,6 +361,7 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
       case GraphState::Disabled:
         break;
     }
+#endif
 
     // Normal execution path (used by Warmup, Disabled, and fallback)
     auto result = context_.call_fn(

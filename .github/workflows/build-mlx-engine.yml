@@ -106,7 +106,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build unzip curl patchelf \
-          libcurl4-openssl-dev libopenblas-dev pkg-config
+          libcurl4-openssl-dev libopenblas-dev liblapacke-dev pkg-config
 
     - name: Download ROCm nightly tarball
       run: |
@@ -164,12 +164,14 @@ jobs:
     - name: Build MLX Engine + ROCm
       run: |
         export HIP_PATH=/opt/rocm
-        export PATH="/opt/rocm/lib/llvm/bin:/opt/rocm/bin:$PATH"
+        export PATH="/opt/rocm/bin:$PATH"
 
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+          -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
           -DCMAKE_HIP_ARCHITECTURES="${{ steps.map-targets.outputs.mapped_target }}" \
           -DMLX_BUILD_ROCM=ON \
           -DMLX_LM_BUILD_TESTS=OFF \
@@ -234,7 +236,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build \
-          libcurl4-openssl-dev libopenblas-dev pkg-config
+          libcurl4-openssl-dev libopenblas-dev liblapacke-dev pkg-config
 
     - name: Build MLX Engine (CPU only)
       run: |

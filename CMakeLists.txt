@@ -130,6 +130,10 @@ target_link_libraries(mlx-lm-common PUBLIC
 )
 target_include_directories(mlx-lm-common PUBLIC ${minja_SOURCE_DIR}/include)
 
+# Propagate ROCm flag as compile definition so C++ code can use #if defined(MLX_BUILD_ROCM)
+if(MLX_BUILD_ROCM)
+    target_compile_definitions(mlx-lm-common PUBLIC MLX_BUILD_ROCM)
+endif()
 
 # LLM library
 add_library(mlx-lm-llm
