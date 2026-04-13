@@ -57,3 +57,29 @@ add_test(NAME test_chat_template COMMAND test_chat_template)
 add_executable(test_nemotron_h test_nemotron_h.cpp)
 target_link_libraries(test_nemotron_h PRIVATE mlx-lm-llm Catch2::Catch2WithMain)
 add_test(NAME test_nemotron_h COMMAND test_nemotron_h)
+
+# Server API integration tests
+add_executable(test_server_api
+    test_server_api.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/server.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/model_manager.cpp
+)
+target_link_libraries(test_server_api PRIVATE
+    mlx-lm-llm mlx-lm-common mlx-lm-core httplib::httplib Catch2::Catch2WithMain
+)
+# Discovery tests (no model required, fast)
+add_test(NAME test_server_api_discovery
+    COMMAND test_server_api "[discovery]"
+)
+# Endpoint tests (no model loaded, tests error paths + /health + /v1/models)
+add_test(NAME test_server_api_endpoints
+    COMMAND test_server_api "[endpoints]"
+)
+# Inference tests (requires cached model, slow)
+add_test(NAME test_server_api_inference
+    COMMAND test_server_api "[inference]"
+)
+# Error handling tests
+add_test(NAME test_server_api_errors
+    COMMAND test_server_api "[errors]"
+)

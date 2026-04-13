@@ -1,0 +1,300 @@
+name: Test MLX Engine
+on:
+  workflow_dispatch:
+    inputs:
+      operating_systems:
+        description: 'Operating systems to test on (comma-separated: ubuntu)'
+        required: false
+        default: 'ubuntu'
+      gfx_target:
+        description: 'AMD GPU targets (comma-separated)'
+        required: false
+        default: 'gfx1151'
+      release_tag:
+        description: 'Release tag to test (e.g., b1001) or "latest" for the most recent release'
+        required: false
+        default: 'latest'
+
+env:
+  OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu' }}
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151' }}
+  RELEASE_TAG: ${{ github.event.inputs.release_tag || 'latest' }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
+      should_test_ubuntu: ${{ steps.set-matrix.outputs.should_test_ubuntu }}
+      latest_release_tag: ${{ steps.get-release.outputs.latest_release_tag }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Get release tag
+      id: get-release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        release_input="${{ env.RELEASE_TAG }}"
+
+        if [ "$release_input" = "latest" ]; then
+          release_tag=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | jq -r '.tag_name')
+          echo "Using latest release: $release_tag"
+        else
+          release_tag="$release_input"
+          echo "Using specified release: $release_tag"
+
+          response_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$release_tag")
+
+          if [ "$response_code" != "200" ]; then
+            echo "Error: Release '$release_tag' does not exist (HTTP $response_code)"
+            exit 1
+          fi
+        fi
+
+        echo "latest_release_tag=$release_tag" >> $GITHUB_OUTPUT
+
+    - name: Set matrix
+      id: set-matrix
+      run: |
+        targets="${{ env.GFX_TARGETS }}"
+        operating_systems="${{ env.OPERATING_SYSTEMS }}"
+
+        matrix_targets=$(echo "$targets" \
+          | tr ',' '\n' \
+          | sed 's/^ *//;s/ *$//' \
+          | sed 's/^"//;s/"$//' \
+          | jq -R . \
+          | jq -s '{gfx_target: .}' \
+          | jq -c)
+
+        should_test_ubuntu="false"
+        if [[ "$operating_systems" == *"ubuntu"* ]]; then
+          should_test_ubuntu="true"
+          echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
+        fi
+
+        echo "should_test_ubuntu=$should_test_ubuntu" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # GPU inference test on self-hosted lemonade-sdk runners
+  # ---------------------------------------------------------------------------
+  test-ubuntu:
+    runs-on: [stx-halo, Linux]
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_test_ubuntu == 'true'
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.ubuntu_matrix) }}
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install jq
+      run: |
+        if ! command -v jq &> /dev/null; then
+          mkdir -p ~/bin
+          curl -L -o ~/bin/jq https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+          chmod +x ~/bin/jq
+          export PATH="$HOME/bin:$PATH"
+          echo "PATH=$HOME/bin:$PATH" >> $GITHUB_ENV
+        fi
+
+    - name: Download release artifacts
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        release_tag="${{ needs.prepare-matrix.outputs.latest_release_tag }}"
+        target="${{ matrix.gfx_target }}"
+        asset_name="mlx-engine-${release_tag}-ubuntu-rocm-${target}-x64.zip"
+        repo="${{ github.repository }}"
+
+        echo "Downloading release asset: $asset_name"
+
+        release_url="https://api.github.com/repos/$repo/releases/tags/$release_tag"
+        release_data=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$release_url")
+
+        download_url=$(echo "$release_data" | jq -r ".assets[] | select(.name == \"$asset_name\") | .browser_download_url")
+
+        if [ "$download_url" = "null" ] || [ -z "$download_url" ]; then
+          echo "Error: Asset '$asset_name' not found in release '$release_tag'"
+          echo "Available assets:"
+          echo "$release_data" | jq -r '.assets[].name'
+          exit 1
+        fi
+
+        curl -L -H "Authorization: token $GITHUB_TOKEN" -o "$asset_name" "$download_url"
+        unzip -q "$asset_name" -d mlx-binaries
+
+        echo "Contents of mlx-binaries:"
+        find mlx-binaries -type f -exec ls -la {} \;
+
+    - name: Download test model
+      run: |
+        # Download a small MLX model for testing
+        # Using mlx-community/Qwen3-1.7B-4bit (935MB, fast to load)
+        model_id="mlx-community/Qwen3-1.7B-4bit"
+        cache_dir="$HOME/.cache/huggingface/hub"
+
+        # Check if already cached
+        model_dir="${cache_dir}/models--mlx-community--Qwen3-1.7B-4bit"
+        if [ -d "$model_dir" ]; then
+          echo "Model already cached"
+        else
+          echo "Downloading model: $model_id"
+          pip install huggingface-hub 2>/dev/null || true
+          python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$model_id')" 2>/dev/null || \
+            echo "Python download failed, will rely on server auto-download"
+        fi
+
+    - name: Set up library path
+      run: |
+        echo "LD_LIBRARY_PATH=$(pwd)/mlx-binaries:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+    - name: Test server health endpoint
+      run: |
+        chmod +x mlx-binaries/server
+
+        # Start server in background (auto-load mode)
+        mlx-binaries/server --port 18999 --no-download &
+        SERVER_PID=$!
+        sleep 2
+
+        # Test health endpoint
+        response=$(curl -s http://127.0.0.1:18999/health)
+        echo "Health response: $response"
+
+        if echo "$response" | grep -q '"ok"'; then
+          echo "Health check PASSED"
+        else
+          echo "Health check FAILED"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+    - name: Test model listing (MLX only)
+      run: |
+        chmod +x mlx-binaries/server
+
+        mlx-binaries/server --port 18998 --no-download &
+        SERVER_PID=$!
+        sleep 2
+
+        response=$(curl -s http://127.0.0.1:18998/v1/models)
+        echo "Models response: $response"
+
+        # Should list models and all should be MLX format
+        model_count=$(echo "$response" | jq '.data | length')
+        echo "Found $model_count available models"
+
+        if [ "$model_count" -gt 0 ]; then
+          echo "Model listing PASSED"
+        else
+          echo "WARNING: No cached models found (this is OK if HF cache is empty)"
+        fi
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+    - name: Test inference (auto-load + chat completion)
+      run: |
+        chmod +x mlx-binaries/server
+
+        # Start server with auto-load
+        mlx-binaries/server --port 18997 --no-think --max-tokens 64 &
+        SERVER_PID=$!
+        sleep 2
+
+        echo "Sending chat completion request..."
+        response=$(curl -s --max-time 300 -X POST http://127.0.0.1:18997/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "stream": false
+          }')
+
+        echo "=== RESPONSE ==="
+        echo "$response" | jq .
+        echo "=== END RESPONSE ==="
+
+        # Verify response
+        content=$(echo "$response" | jq -r '.choices[0].message.content')
+        echo "Generated content: $content"
+
+        if echo "$content" | grep -q "4"; then
+          echo "Inference test PASSED - Model correctly answered 2+2=4"
+        else
+          echo "Inference test FAILED - Expected '4' in response"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        # Verify usage stats
+        prompt_tokens=$(echo "$response" | jq '.usage.prompt_tokens')
+        completion_tokens=$(echo "$response" | jq '.usage.completion_tokens')
+        echo "Tokens: prompt=$prompt_tokens, completion=$completion_tokens"
+
+        if [ "$prompt_tokens" -gt 0 ] && [ "$completion_tokens" -gt 0 ]; then
+          echo "Usage stats PASSED"
+        else
+          echo "Usage stats FAILED"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+    - name: Test streaming inference
+      run: |
+        chmod +x mlx-binaries/server
+
+        mlx-binaries/server --port 18996 --no-think --max-tokens 64 &
+        SERVER_PID=$!
+        sleep 2
+
+        echo "Sending streaming chat completion request..."
+        response=$(curl -s --max-time 300 -X POST http://127.0.0.1:18996/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "stream": true
+          }')
+
+        echo "=== STREAM RESPONSE ==="
+        echo "$response"
+        echo "=== END STREAM ==="
+
+        # Check for [DONE] sentinel
+        if echo "$response" | grep -q '\[DONE\]'; then
+          echo "Streaming test PASSED - Got [DONE] sentinel"
+        else
+          echo "Streaming test FAILED - Missing [DONE] sentinel"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        # Check content contains "4"
+        if echo "$response" | grep -q '"4"'; then
+          echo "Streaming content PASSED"
+        else
+          echo "WARNING: '4' not found in streamed chunks (may be split across chunks)"
+        fi
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true

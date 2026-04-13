@@ -52,7 +52,11 @@ void HubApi::set_token(const std::string& token) {
 std::string HubApi::cache_dir() const {
     if (!cache_dir_.empty()) return cache_dir_;
 
-    // Check HF_HOME, then default
+    // Priority: HF_HUB_CACHE > HF_HOME/hub > ~/.cache/huggingface/hub
+    // Matches llama.cpp and huggingface-hub conventions.
+    if (const char* hub_cache = std::getenv("HF_HUB_CACHE")) {
+        return std::string(hub_cache);
+    }
     if (const char* hf_home = std::getenv("HF_HOME")) {
         return std::string(hf_home) + "/hub";
     }
@@ -71,25 +75,89 @@ void HubApi::set_cache_dir(const std::string& dir) {
     cache_dir_ = dir;
 }
 
+// Convert repo_id ("org/repo") to HF cache dir name ("models--org--repo").
+static std::string repo_id_to_cache_key(const std::string& repo_id) {
+    std::string key = "models--";
+    for (char c : repo_id) {
+        if (c == '/') key += "--";
+        else key += c;
+    }
+    return key;
+}
+
+// Given a models--X directory, find the best snapshot path.
+// Standard HF: refs/main → commit hash → snapshots/{hash}/
+// Our legacy:  snapshots/main/ directly
+static std::string resolve_snapshot_dir(const std::string& model_dir,
+                                         const std::string& revision) {
+    // Try standard HF layout: read refs/{revision} to get commit hash
+    auto refs_path = model_dir + "/refs/" + revision;
+    if (fs::exists(refs_path) && fs::is_regular_file(refs_path)) {
+        std::ifstream f(refs_path);
+        std::string hash;
+        std::getline(f, hash);
+        // Trim whitespace
+        while (!hash.empty() && (hash.back() == '\n' || hash.back() == '\r' || hash.back() == ' '))
+            hash.pop_back();
+        if (!hash.empty()) {
+            auto snap = model_dir + "/snapshots/" + hash;
+            if (fs::exists(snap)) return snap;
+        }
+    }
+
+    // Fallback: snapshots/{revision}/ directly (our legacy format)
+    auto direct = model_dir + "/snapshots/" + revision;
+    if (fs::exists(direct)) return direct;
+
+    // Last resort: find any snapshot directory
+    auto snap_dir = model_dir + "/snapshots";
+    if (fs::exists(snap_dir) && fs::is_directory(snap_dir)) {
+        for (const auto& entry : fs::directory_iterator(snap_dir)) {
+            if (entry.is_directory()) return entry.path().string();
+        }
+    }
+
+    // Return the standard path even if it doesn't exist yet (for downloads)
+    return direct;
+}
+
 std::string HubApi::resolve_cache_path(const std::string& repo_id,
                                         const std::string& revision) const {
-    // models--org--name/snapshots/revision
-    std::string safe_id = repo_id;
-    for (auto& c : safe_id) {
-        if (c == '/') c = '-';
-        if (c == '-') continue;
+    auto base = cache_dir();
+    auto cache_key = repo_id_to_cache_key(repo_id);
+    auto model_dir = base + "/" + cache_key;
+
+    // If the standard-format directory exists, resolve its snapshot
+    if (fs::exists(model_dir)) {
+        return resolve_snapshot_dir(model_dir, revision);
     }
-    // Standard HF cache layout: models--{org}--{name}
-    std::string cache_key = "models--";
+
+    // Check legacy format (models--org-repo with single dash)
+    std::string legacy_key = "models--";
     for (char c : repo_id) {
-        cache_key += (c == '/') ? '-' : c;
+        legacy_key += (c == '/') ? '-' : c;
     }
-    return cache_dir() + "/" + cache_key + "/snapshots/" + revision;
+    auto legacy_dir = base + "/" + legacy_key;
+    if (fs::exists(legacy_dir)) {
+        return resolve_snapshot_dir(legacy_dir, revision);
+    }
+
+    // Neither exists — return standard format path for new downloads
+    return model_dir + "/snapshots/" + revision;
 }
 
 bool HubApi::is_cached(const std::string& repo_id, const std::string& revision) const {
     auto path = resolve_cache_path(repo_id, revision);
-    return fs::exists(path) && fs::exists(path + "/config.json");
+    if (!fs::exists(path) || !fs::exists(path + "/config.json"))
+        return false;
+
+    // Must have safetensors files (MLX format only, not GGUF)
+    for (const auto& entry : fs::directory_iterator(path)) {
+        auto ext = entry.path().extension().string();
+        if (ext == ".safetensors") return true;
+    }
+    // Also accept sharded format (model.safetensors.index.json)
+    return fs::exists(path + "/model.safetensors.index.json");
 }
 
 std::string HubApi::model_directory(const std::string& repo_id,
@@ -238,6 +306,67 @@ std::string HubApi::snapshot_download(
     }
 
     return cache_path;
+}
+
+// Convert a cache directory name back to a HF repo_id.
+// "models--org--repo-name" → "org/repo-name"
+// "models--org-repo-name"  → ambiguous (legacy), use first dash as separator
+static std::string cache_key_to_repo_id(const std::string& dir_name) {
+    // Strip "models--" prefix
+    if (dir_name.size() < 9 || dir_name.substr(0, 8) != "models--") return "";
+    auto rest = dir_name.substr(8);
+
+    // Standard format: org--repo (double dash)
+    auto pos = rest.find("--");
+    if (pos != std::string::npos) {
+        return rest.substr(0, pos) + "/" + rest.substr(pos + 2);
+    }
+
+    // Legacy format: org-repo (single dash) — use first dash as separator
+    pos = rest.find('-');
+    if (pos != std::string::npos) {
+        return rest.substr(0, pos) + "/" + rest.substr(pos + 1);
+    }
+
+    // No separator — bare model name
+    return rest;
+}
+
+// Check if a snapshot directory contains MLX model files (safetensors).
+static bool is_mlx_model_dir(const std::string& snap_path) {
+    if (!fs::exists(snap_path + "/config.json")) return false;
+
+    for (const auto& entry : fs::directory_iterator(snap_path)) {
+        if (entry.path().extension() == ".safetensors") return true;
+    }
+    return fs::exists(snap_path + "/model.safetensors.index.json");
+}
+
+std::vector<HubApi::CachedModel> HubApi::discover_cached_models() const {
+    std::vector<CachedModel> result;
+    auto base = cache_dir();
+
+    if (!fs::exists(base) || !fs::is_directory(base)) return result;
+
+    for (const auto& entry : fs::directory_iterator(base)) {
+        if (!entry.is_directory()) continue;
+
+        auto dir_name = entry.path().filename().string();
+        if (dir_name.substr(0, 8) != "models--") continue;
+
+        auto repo_id = cache_key_to_repo_id(dir_name);
+        if (repo_id.empty()) continue;
+
+        // Resolve the best snapshot directory
+        auto snap_path = resolve_snapshot_dir(entry.path().string(), "main");
+
+        // Only include MLX models (safetensors + config.json, not GGUF)
+        if (is_mlx_model_dir(snap_path)) {
+            result.push_back({repo_id, snap_path});
+        }
+    }
+
+    return result;
 }
 
 HubApi& HubApi::shared() {

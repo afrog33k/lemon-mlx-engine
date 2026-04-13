@@ -1,0 +1,451 @@
+name: Build MLX Engine
+on:
+  workflow_dispatch:
+    inputs:
+      operating_systems:
+        description: 'Operating systems to build for (comma-separated: ubuntu,macos)'
+        required: false
+        default: 'ubuntu,macos'
+      gfx_target:
+        description: 'AMD GPU targets for ROCm builds (comma-separated)'
+        required: false
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+      rocm_version:
+        description: 'ROCm version (e.g., 7.13.0a20260318) or "latest" to auto-detect'
+        required: false
+        default: 'latest'
+      create_release:
+        description: 'Create a GitHub release after successful build'
+        required: false
+        default: true
+        type: boolean
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  schedule:
+    - cron: '0 14 * * *'
+
+env:
+  OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu,macos' }}
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Prepare build matrices
+  # ---------------------------------------------------------------------------
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      rocm_matrix: ${{ steps.set-matrix.outputs.rocm_matrix }}
+      should_build_ubuntu_rocm: ${{ steps.set-matrix.outputs.should_build_ubuntu_rocm }}
+      should_build_ubuntu_cpu: ${{ steps.set-matrix.outputs.should_build_ubuntu_cpu }}
+      should_build_macos: ${{ steps.set-matrix.outputs.should_build_macos }}
+    steps:
+    - name: Set matrix
+      id: set-matrix
+      run: |
+        targets="${{ env.GFX_TARGETS }}"
+        operating_systems="${{ env.OPERATING_SYSTEMS }}"
+
+        echo "Input targets: $targets"
+        echo "Input operating systems: $operating_systems"
+
+        # Convert targets to JSON array for ROCm matrix
+        matrix_targets=$(echo "$targets" \
+          | tr ',' '\n' \
+          | sed 's/^ *//;s/ *$//' \
+          | sed 's/^"//;s/"$//' \
+          | jq -R . \
+          | jq -s '{gfx_target: .}' \
+          | jq -c)
+
+        should_build_ubuntu_rocm="false"
+        should_build_ubuntu_cpu="false"
+        should_build_macos="false"
+
+        if [[ "$operating_systems" == *"ubuntu"* ]]; then
+          should_build_ubuntu_rocm="true"
+          should_build_ubuntu_cpu="true"
+          echo "rocm_matrix=$matrix_targets" >> $GITHUB_OUTPUT
+        fi
+
+        if [[ "$operating_systems" == *"macos"* ]]; then
+          should_build_macos="true"
+        fi
+
+        echo "should_build_ubuntu_rocm=$should_build_ubuntu_rocm" >> $GITHUB_OUTPUT
+        echo "should_build_ubuntu_cpu=$should_build_ubuntu_cpu" >> $GITHUB_OUTPUT
+        echo "should_build_macos=$should_build_macos" >> $GITHUB_OUTPUT
+
+        echo "Ubuntu ROCm build: $should_build_ubuntu_rocm"
+        echo "Ubuntu CPU build: $should_build_ubuntu_cpu"
+        echo "macOS build: $should_build_macos"
+
+  # ---------------------------------------------------------------------------
+  # Ubuntu + ROCm build (per GPU target)
+  # ---------------------------------------------------------------------------
+  build-ubuntu-rocm:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build_ubuntu_rocm == 'true'
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.rocm_matrix) }}
+      fail-fast: false
+    outputs:
+      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build unzip curl patchelf \
+          libcurl4-openssl-dev liblapack-dev libblas-dev pkg-config
+
+    - name: Download ROCm nightly tarball
+      run: |
+        rocm_version="${{ env.ROCM_VERSION }}"
+        current_target="${{ matrix.gfx_target }}"
+
+        # Map target to S3 naming
+        s3_target="$current_target"
+        if [ "$current_target" = "gfx103X" ]; then
+          s3_target="${current_target}-dgpu"
+        elif [ "$current_target" = "gfx110X" ] || [ "$current_target" = "gfx120X" ]; then
+          s3_target="${current_target}-all"
+        fi
+
+        if [ "$rocm_version" = "latest" ]; then
+          echo "Auto-detecting latest ROCm version for target: $current_target"
+          # List S3 and find latest version
+          files=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-$s3_target-7" \
+            | grep -oP 'therock-dist-linux-'"$s3_target"'-[^<]+\.tar\.gz' \
+            | sort -V | tail -1)
+
+          if [ -z "$files" ]; then
+            echo "Error: No ROCm tarballs found for target $s3_target"
+            exit 1
+          fi
+
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$files"
+          rocm_version=$(echo "$files" | grep -oP '\d+\.\d+\.\d+[a-z]*\d*')
+          echo "Detected latest ROCm version: $rocm_version"
+        else
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+        fi
+
+        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
+
+        echo "Downloading ROCm from: $rocm_url"
+        sudo mkdir -p /opt/rocm
+        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+
+    - name: Map GPU targets
+      id: map-targets
+      run: |
+        current_target="${{ matrix.gfx_target }}"
+        case "$current_target" in
+          gfx110X) mapped="gfx1100;gfx1101;gfx1102;gfx1103" ;;
+          gfx103X) mapped="gfx1030;gfx1031;gfx1032;gfx1034" ;;
+          gfx1151) mapped="gfx1151" ;;
+          gfx1150) mapped="gfx1150" ;;
+          gfx120X) mapped="gfx1200;gfx1201" ;;
+          *) mapped="$current_target" ;;
+        esac
+        echo "mapped_target=$mapped" >> $GITHUB_OUTPUT
+        echo "Mapped target: $mapped"
+
+    - name: Build MLX Engine + ROCm
+      env:
+        HIP_PATH: /opt/rocm
+        PATH: /opt/rocm/lib/llvm/bin:/opt/rocm/bin:${{ env.PATH }}
+      run: |
+        mkdir -p build && cd build
+
+        cmake .. -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_HIP_ARCHITECTURES="${{ steps.map-targets.outputs.mapped_target }}" \
+          -DMLX_BUILD_ROCM=ON \
+          -DMLX_LM_BUILD_TESTS=OFF \
+          -DMLX_LM_BUILD_EXAMPLES=ON
+
+        cmake --build . -j $(nproc)
+
+    - name: Package build artifacts
+      run: |
+        mkdir -p output
+        cp build/server output/
+        cp build/chat output/
+        cp build/diagnose output/ 2>/dev/null || true
+
+        # Copy shared libraries
+        cp build/libmlx*.a output/ 2>/dev/null || true
+
+        # Copy essential ROCm libraries for portable distribution
+        for lib in libamdhip64.so* librocblas.so* libhipblas*.so* libhipblaslt*.so* librocsolver.so* libamd_comgr.so*; do
+          cp /opt/rocm/lib/$lib output/ 2>/dev/null || true
+        done
+
+        # Also copy rocblas kernels directory if present
+        if [ -d /opt/rocm/lib/rocblas/library ]; then
+          cp -r /opt/rocm/lib/rocblas output/
+        fi
+
+        # Set RPATH for portable distribution
+        for binary in output/server output/chat; do
+          if [ -f "$binary" ]; then
+            patchelf --set-rpath '$ORIGIN' "$binary" 2>/dev/null || true
+          fi
+        done
+
+    - name: Set outputs
+      id: set-outputs
+      run: |
+        echo "rocm_version=${{ env.DETECTED_ROCM_VERSION }}" >> $GITHUB_OUTPUT
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mlx-engine-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+        path: output/
+        retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Ubuntu CPU-only build
+  # ---------------------------------------------------------------------------
+  build-ubuntu-cpu:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build_ubuntu_cpu == 'true'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build \
+          libcurl4-openssl-dev liblapack-dev libblas-dev pkg-config
+
+    - name: Build MLX Engine (CPU only)
+      run: |
+        mkdir -p build && cd build
+
+        cmake .. -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DMLX_BUILD_ROCM=OFF \
+          -DMLX_LM_BUILD_TESTS=ON \
+          -DMLX_LM_BUILD_EXAMPLES=ON
+
+        cmake --build . -j $(nproc)
+
+    - name: Run unit tests (CPU-safe only)
+      run: |
+        cd build
+        ctest --test-dir tests -R "test_types|test_config|test_generate|test_kv_cache|test_chat_template|test_rope_utils" \
+          --output-on-failure --timeout 120
+
+    - name: Package build artifacts
+      run: |
+        mkdir -p output
+        cp build/server output/
+        cp build/chat output/
+        cp build/diagnose output/ 2>/dev/null || true
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mlx-engine-ubuntu-cpu-x64
+        path: output/
+        retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # macOS build (Metal / CPU)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-latest
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build_macos == 'true'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install build dependencies
+      run: |
+        brew install cmake ninja curl
+
+    - name: Build MLX Engine (macOS)
+      run: |
+        mkdir -p build && cd build
+
+        cmake .. -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DMLX_LM_BUILD_TESTS=ON \
+          -DMLX_LM_BUILD_EXAMPLES=ON
+
+        cmake --build . -j $(sysctl -n hw.ncpu)
+
+    - name: Run unit tests
+      run: |
+        cd build
+        ctest --test-dir tests -R "test_types|test_config|test_generate|test_kv_cache|test_chat_template|test_rope_utils" \
+          --output-on-failure --timeout 120
+
+    - name: Package build artifacts
+      run: |
+        mkdir -p output
+        cp build/server output/
+        cp build/chat output/
+        cp build/diagnose output/ 2>/dev/null || true
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mlx-engine-macos-arm64
+        path: output/
+        retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Create Release
+  # ---------------------------------------------------------------------------
+  create-release:
+    needs: [prepare-matrix, build-ubuntu-rocm, build-ubuntu-cpu, build-macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    if: |
+      always() &&
+      (needs.build-ubuntu-rocm.result == 'success' || needs.build-ubuntu-cpu.result == 'success' || needs.build-macos.result == 'success') &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
+       github.event_name == 'schedule')
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./all-artifacts
+
+    - name: Generate release tag
+      id: generate-tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
+
+        if [ -z "$existing_tags" ]; then
+          next_number=1000
+          echo "No existing sequential release tags found, starting with b1000"
+        else
+          highest_tag=$(echo "$existing_tags" | tail -n 1)
+          highest_number=$(echo "$highest_tag" | sed 's/^b//')
+          next_number=$((highest_number + 1))
+          echo "Highest existing tag: $highest_tag (number: $highest_number)"
+        fi
+
+        TAG=$(printf "b%04d" $next_number)
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "Generated release tag: ${TAG}"
+
+    - name: Check if tag already exists
+      id: check-tag
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+          echo "Tag $TAG already exists, skipping release creation"
+          echo "tag_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create archives
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        targets="${{ env.GFX_TARGETS }}"
+
+        echo "Processing artifacts for release $TAG"
+
+        # ROCm builds
+        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+        for target in "${TARGET_ARRAY[@]}"; do
+          target=$(echo "$target" | xargs)
+          artifact_dir="./all-artifacts/mlx-engine-ubuntu-rocm-${target}-x64"
+          archive_name="mlx-engine-${TAG}-ubuntu-rocm-${target}-x64"
+          if [ -d "$artifact_dir" ]; then
+            echo "Creating archive: ${archive_name}.zip"
+            cd "$artifact_dir"
+            zip -r "../../${archive_name}.zip" *
+            cd ../../
+          fi
+        done
+
+        # CPU build
+        if [ -d "./all-artifacts/mlx-engine-ubuntu-cpu-x64" ]; then
+          echo "Creating archive: mlx-engine-${TAG}-ubuntu-cpu-x64.zip"
+          cd "./all-artifacts/mlx-engine-ubuntu-cpu-x64"
+          zip -r "../../mlx-engine-${TAG}-ubuntu-cpu-x64.zip" *
+          cd ../../
+        fi
+
+        # macOS build
+        if [ -d "./all-artifacts/mlx-engine-macos-arm64" ]; then
+          echo "Creating archive: mlx-engine-${TAG}-macos-arm64.zip"
+          cd "./all-artifacts/mlx-engine-macos-arm64"
+          zip -r "../../mlx-engine-${TAG}-macos-arm64.zip" *
+          cd ../../
+        fi
+
+        echo "Created archives:"
+        ls -la *.zip 2>/dev/null || echo "No archives created"
+
+    - name: Create Release
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        ROCM_VERSION="${{ needs.build-ubuntu-rocm.outputs.rocm_version }}"
+        targets="${{ env.GFX_TARGETS }}"
+
+        # Collect all zip files
+        upload_files=$(ls *.zip 2>/dev/null | tr '\n' ' ')
+
+        if [ -z "$upload_files" ]; then
+          echo "No archives to upload, skipping release"
+          exit 0
+        fi
+
+        echo "Files to upload: $upload_files"
+
+        gh release create "$TAG" \
+          --title "$TAG" \
+          --notes "**Build Number**: $TAG
+        **GPU Target(s)**: $targets
+        **ROCm Version**: $ROCM_VERSION
+        **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        MLX Engine binaries with ROCm, CPU, and macOS support.
+
+        ### Downloads
+        - **Ubuntu ROCm**: mlx-engine-${TAG}-ubuntu-rocm-{target}-x64.zip
+        - **Ubuntu CPU**: mlx-engine-${TAG}-ubuntu-cpu-x64.zip
+        - **macOS ARM64**: mlx-engine-${TAG}-macos-arm64.zip" \
+          $upload_files

@@ -46,6 +46,14 @@ public:
     std::string model_directory(const std::string& repo_id,
                                 const std::string& revision = "main") const;
 
+    // Discover all cached MLX models (safetensors + config.json).
+    // Returns pairs of (model_id, local_directory_path).
+    struct CachedModel {
+        std::string model_id;    // e.g. "mlx-community/Qwen3-4B-4bit"
+        std::string local_path;  // absolute path to snapshot directory
+    };
+    std::vector<CachedModel> discover_cached_models() const;
+
     // Shared default instance.
     static HubApi& shared();
 

@@ -1,0 +1,101 @@
+name: 'Test MLX Engine Build'
+description: 'Download and test MLX Engine build artifacts on a GPU runner'
+
+inputs:
+  os_type:
+    description: 'Operating system type (Linux or macOS)'
+    required: true
+  gfx_target:
+    description: 'GPU target (e.g., gfx1151, gfx1150)'
+    required: true
+  artifact_name:
+    description: 'Full artifact name to download'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: mlx-binaries
+
+    - name: Set up library path (Linux)
+      if: inputs.os_type == 'Linux'
+      shell: bash
+      run: |
+        echo "LD_LIBRARY_PATH=$(pwd)/mlx-binaries:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+    - name: Make binaries executable
+      shell: bash
+      run: |
+        chmod +x mlx-binaries/server mlx-binaries/chat 2>/dev/null || true
+
+    - name: Test health endpoint
+      shell: bash
+      run: |
+        mlx-binaries/server --port 19100 --no-download &
+        SERVER_PID=$!
+        sleep 2
+
+        response=$(curl -s http://127.0.0.1:19100/health)
+        echo "Health response: $response"
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+        if echo "$response" | grep -q '"ok"'; then
+          echo "Health check PASSED"
+        else
+          echo "Health check FAILED"
+          exit 1
+        fi
+
+    - name: Test model listing
+      shell: bash
+      run: |
+        mlx-binaries/server --port 19101 --no-download &
+        SERVER_PID=$!
+        sleep 2
+
+        response=$(curl -s http://127.0.0.1:19101/v1/models)
+        echo "Models: $response"
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+        model_count=$(echo "$response" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "0")
+        echo "Found $model_count available MLX models"
+
+    - name: Test inference with auto-load
+      shell: bash
+      run: |
+        mlx-binaries/server --port 19102 --no-think --max-tokens 64 &
+        SERVER_PID=$!
+        sleep 2
+
+        response=$(curl -s --max-time 300 -X POST http://127.0.0.1:19102/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "stream": false
+          }')
+
+        echo "Response: $response"
+
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+        content=$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+        echo "Generated: $content"
+
+        if echo "$content" | grep -q "4"; then
+          echo "Inference test PASSED"
+        else
+          echo "Inference test FAILED - Expected '4' in: $content"
+          exit 1
+        fi

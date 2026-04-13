@@ -11,9 +11,11 @@ option(MLX_LM_BUILD_EXAMPLES "Build example programs" ON)
 # Third-party dependencies
 include(FetchContent)
 
-# Enable ROCm/AMD GPU backend on non-Apple platforms
+# Enable ROCm/AMD GPU backend on non-Apple platforms (default ON, can be overridden)
 if(NOT APPLE)
-    set(MLX_BUILD_ROCM ON CACHE BOOL "Build ROCm backend" FORCE)
+    if(NOT DEFINED MLX_BUILD_ROCM)
+        set(MLX_BUILD_ROCM ON CACHE BOOL "Build ROCm backend")
+    endif()
     if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
         set(CMAKE_HIP_ARCHITECTURES
             "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
@@ -80,6 +82,15 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(minja)
+
+# cpp-httplib — header-only HTTP server (OpenAI-compatible API)
+FetchContent_Declare(
+    httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.18.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(httplib)
 
 # Global include path (enables #include <mlx-lm/...>)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -210,6 +221,13 @@ if(MLX_LM_BUILD_EXAMPLES)
 
     add_executable(test_gdn examples/test_gdn.cpp)
     target_link_libraries(test_gdn PRIVATE mlx)
+
+    add_executable(server
+        examples/server.cpp
+        src/common/server.cpp
+        src/common/model_manager.cpp
+    )
+    target_link_libraries(server PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core httplib::httplib)
 endif()
 
 if(MLX_LM_BUILD_TESTS)
