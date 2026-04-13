@@ -98,7 +98,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -106,7 +106,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build unzip curl patchelf \
-          libcurl4-openssl-dev liblapack-dev libblas-dev pkg-config
+          libcurl4-openssl-dev libopenblas-dev pkg-config
 
     - name: Download ROCm nightly tarball
       run: |
@@ -162,10 +162,10 @@ jobs:
         echo "Mapped target: $mapped"
 
     - name: Build MLX Engine + ROCm
-      env:
-        HIP_PATH: /opt/rocm
-        PATH: /opt/rocm/lib/llvm/bin:/opt/rocm/bin:${{ env.PATH }}
       run: |
+        export HIP_PATH=/opt/rocm
+        export PATH="/opt/rocm/lib/llvm/bin:/opt/rocm/bin:$PATH"
+
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
@@ -210,7 +210,7 @@ jobs:
         echo "rocm_version=${{ env.DETECTED_ROCM_VERSION }}" >> $GITHUB_OUTPUT
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: mlx-engine-ubuntu-rocm-${{ matrix.gfx_target }}-x64
         path: output/
@@ -226,7 +226,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -234,7 +234,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build \
-          libcurl4-openssl-dev liblapack-dev libblas-dev pkg-config
+          libcurl4-openssl-dev libopenblas-dev pkg-config
 
     - name: Build MLX Engine (CPU only)
       run: |
@@ -262,7 +262,7 @@ jobs:
         cp build/diagnose output/ 2>/dev/null || true
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: mlx-engine-ubuntu-cpu-x64
         path: output/
@@ -278,7 +278,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -311,7 +311,7 @@ jobs:
         cp build/diagnose output/ 2>/dev/null || true
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: mlx-engine-macos-arm64
         path: output/
@@ -336,10 +336,10 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Download all build artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v6
       with:
         path: ./all-artifacts
 
