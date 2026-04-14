@@ -133,7 +133,7 @@ jobs:
       run: |
         current_target="${{ matrix.gfx_target }}"
         case "$current_target" in
-          gfx110X) mapped="gfx1100;gfx1101;gfx1102;gfx1103" ;;
+          gfx110X) mapped="gfx1100;gfx1101;gfx1102" ;;
           gfx103X) mapped="gfx1030;gfx1031;gfx1032;gfx1034" ;;
           gfx1151) mapped="gfx1151" ;;
           gfx1150) mapped="gfx1150" ;;
