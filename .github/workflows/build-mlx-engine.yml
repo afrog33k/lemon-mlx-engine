@@ -121,7 +121,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build patchelf \
           libcurl4-openssl-dev libopenblas-dev liblapacke-dev pkg-config \
-          hip-dev rocblas-dev hipblas-dev hipblaslt-dev rocsolver-dev
+          hip-dev rocblas-dev hipblas-dev hipblaslt-dev rocsolver-dev \
+          rocthrust-dev rocprim-dev hiprand-dev rocwmma-dev
 
         echo "Installed ROCm version: $rocm_version"
         echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
