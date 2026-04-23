@@ -39,7 +39,7 @@ FetchContent_Declare(
     # to soloish90's 8-bit QMV fix (last known-good) keeps CI green until
     # NripeshN lands the ROCm clear_streams() shim. See lemonade-sdk/
     # lemon-mlx-engine#19 discussion.
-    GIT_TAG        39fac95de6a0ae9d7d4c9e6488eccf5148c9f2fb
+    GIT_TAG        39fac95d901c72175fce4baf973e375d4a054ba7
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(mlx)
