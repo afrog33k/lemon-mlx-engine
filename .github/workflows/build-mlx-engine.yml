@@ -88,14 +88,30 @@ jobs:
 
     - name: Install ROCm
       run: |
-        sudo mkdir -p /opt/rocm
         if [ "${{ matrix.rocm_source }}" = "github-release" ]; then
+          # Toolchain (compiler, headers, cmake configs) from AMD apt — the
+          # rocm-stable bundle ships only runtime .so files.
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ matrix.rocm_version }} jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get install -y rocm-hip-sdk rocwmma-dev
+
+          # Overlay runtime libs from lemonade-sdk/rocm-stable (GPU-target-trimmed,
+          # version-matched to the apt SDK above).
           url="https://github.com/${{ matrix.release_repo }}/releases/download/v${{ matrix.rocm_version }}/rocm-${{ matrix.rocm_version }}-runtime-libs.tar.gz"
+          echo "Overlaying runtime libs from $url"
+          curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
         else
+          sudo mkdir -p /opt/rocm
           url="https://repo.amd.com/rocm/tarball/therock-dist-linux-gfx1151-${{ matrix.rocm_version }}.tar.gz"
+          echo "Installing ROCm ${{ matrix.rocm_version }} from $url"
+          curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
         fi
-        echo "Installing ROCm ${{ matrix.rocm_version }} from $url"
-        curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
 
     - name: Set ROCm environment variables
       run: |
