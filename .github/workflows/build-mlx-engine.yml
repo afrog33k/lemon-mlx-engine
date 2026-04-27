@@ -66,7 +66,8 @@ jobs:
         include:
           - channel: stable
             rocm_version: "7.2.1"
-            rocm_source: amd-apt
+            rocm_source: github-release
+            release_repo: lemonade-sdk/rocm-stable
             gpu_targets: "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
           - channel: preview
             rocm_version: "7.12.0"
@@ -87,23 +88,14 @@ jobs:
 
     - name: Install ROCm
       run: |
-        if [ "${{ matrix.rocm_source }}" = "amd-apt" ]; then
-          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-          wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - \
-            | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ matrix.rocm_version }} jammy main" \
-            | sudo tee /etc/apt/sources.list.d/rocm.list
-          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
-            | sudo tee /etc/apt/preferences.d/rocm-pin-600
-          sudo apt-get update
-          sudo apt-get install -y rocm-hip-sdk rocblas-dev hipblas-dev hipblaslt-dev \
-            rocsolver-dev rocthrust-dev rocprim-dev hiprand-dev rocrand-dev rocwmma-dev
+        sudo mkdir -p /opt/rocm
+        if [ "${{ matrix.rocm_source }}" = "github-release" ]; then
+          url="https://github.com/${{ matrix.release_repo }}/releases/download/v${{ matrix.rocm_version }}/rocm-${{ matrix.rocm_version }}-runtime-libs.tar.gz"
         else
           url="https://repo.amd.com/rocm/tarball/therock-dist-linux-gfx1151-${{ matrix.rocm_version }}.tar.gz"
-          echo "Installing ROCm ${{ matrix.rocm_version }} from $url"
-          sudo mkdir -p /opt/rocm
-          curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
         fi
+        echo "Installing ROCm ${{ matrix.rocm_version }} from $url"
+        curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
 
     - name: Set ROCm environment variables
       run: |
