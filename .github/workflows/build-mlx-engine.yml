@@ -106,7 +106,31 @@ jobs:
         echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
         echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
         echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
-        echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
+        echo "/opt/rocm/bin:/opt/rocm/llvm/bin:/opt/rocm/lib/llvm/bin:$PATH" >> $GITHUB_PATH
+
+    - name: Locate ROCm clang
+      id: rocm-paths
+      run: |
+        set -euo pipefail
+        find_in_rocm() {
+          find /opt/rocm \( -type f -o -type l \) -name "$1" -path '*/llvm/bin/*' 2>/dev/null | head -n 1
+        }
+        CLANG_PATH=$(find_in_rocm amdclang)
+        [ -n "$CLANG_PATH" ] || CLANG_PATH=$(find_in_rocm clang)
+        if [ -z "$CLANG_PATH" ]; then
+          echo "::error::No amdclang/clang under /opt/rocm/**/llvm/bin/"
+          find /opt/rocm -maxdepth 6 -type d -path '*/llvm/bin' 2>/dev/null
+          exit 1
+        fi
+        CLANG_DIR=$(dirname "$CLANG_PATH")
+        case "$(basename "$CLANG_PATH")" in
+          amdclang) CLANGXX_PATH="$CLANG_DIR/amdclang++" ;;
+          clang)    CLANGXX_PATH="$CLANG_DIR/clang++" ;;
+        esac
+        echo "clang:   $CLANG_PATH"
+        echo "clang++: $CLANGXX_PATH"
+        echo "clang=$CLANG_PATH" >> $GITHUB_OUTPUT
+        echo "clangxx=$CLANGXX_PATH" >> $GITHUB_OUTPUT
 
     - name: Cache FetchContent MLX source
       uses: actions/cache@v4
@@ -120,14 +144,14 @@ jobs:
       run: |
         export HIP_PATH=/opt/rocm
         export ROCM_PATH=/opt/rocm
-        export PATH="/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH"
+        export PATH="/opt/rocm/bin:/opt/rocm/llvm/bin:/opt/rocm/lib/llvm/bin:$PATH"
 
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/amdclang \
-          -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/amdclang++ \
+          -DCMAKE_C_COMPILER="${{ steps.rocm-paths.outputs.clang }}" \
+          -DCMAKE_CXX_COMPILER="${{ steps.rocm-paths.outputs.clangxx }}" \
           -DCMAKE_PREFIX_PATH=/opt/rocm \
           -DCMAKE_HIP_ARCHITECTURES="${{ matrix.gpu_targets }}" \
           -DCMAKE_CXX_CLANG_TIDY= \
