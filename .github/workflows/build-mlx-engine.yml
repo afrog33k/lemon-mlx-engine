@@ -6,18 +6,6 @@ on:
         description: 'Operating systems to build for (comma-separated: ubuntu,macos)'
         required: false
         default: 'ubuntu,macos'
-      gfx_target:
-        description: 'AMD GPU targets for ROCm builds (comma-separated)'
-        required: false
-        default: 'gfx110X,gfx1150,gfx1151,gfx120X,gfx115X_gfx120X'
-      rocm_channel:
-        description: 'ROCm channel: preview (7.2.1 from AMD apt) or stable (7.12.x from AMD apt). Both sourced directly from https://repo.radeon.com/rocm/apt/. Only these two values are accepted.'
-        required: false
-        default: 'preview'
-        type: choice
-        options:
-          - preview
-          - stable
       create_release:
         description: 'Create a GitHub release after successful build'
         required: false
@@ -28,24 +16,15 @@ on:
     types: [opened, synchronize, reopened]
 
   schedule:
-    # Daily: preview channel (ROCm 7.2.1 from AMD apt)
     - cron: '0 14 * * *'
-    # Weekly Monday: stable channel (ROCm 7.12.x from AMD apt)
-    - cron: '0 16 * * 1'
 
 env:
   OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu,macos' }}
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1150,gfx1151,gfx120X,gfx115X_gfx120X' }}
-  ROCM_CHANNEL: ${{ github.event.inputs.rocm_channel || (github.event.schedule == '0 16 * * 1' && 'stable') || 'preview' }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Prepare build matrices
-  # ---------------------------------------------------------------------------
   prepare-matrix:
     runs-on: ubuntu-22.04
     outputs:
-      rocm_matrix: ${{ steps.set-matrix.outputs.rocm_matrix }}
       should_build_ubuntu_rocm: ${{ steps.set-matrix.outputs.should_build_ubuntu_rocm }}
       should_build_ubuntu_cpu: ${{ steps.set-matrix.outputs.should_build_ubuntu_cpu }}
       should_build_macos: ${{ steps.set-matrix.outputs.should_build_macos }}
@@ -53,20 +32,8 @@ jobs:
     - name: Set matrix
       id: set-matrix
       run: |
-        targets="${{ env.GFX_TARGETS }}"
         operating_systems="${{ env.OPERATING_SYSTEMS }}"
-
-        echo "Input targets: $targets"
         echo "Input operating systems: $operating_systems"
-
-        # Convert targets to JSON array for ROCm matrix
-        matrix_targets=$(echo "$targets" \
-          | tr ',' '\n' \
-          | sed 's/^ *//;s/ *$//' \
-          | sed 's/^"//;s/"$//' \
-          | jq -R . \
-          | jq -s '{gfx_target: .}' \
-          | jq -c)
 
         should_build_ubuntu_rocm="false"
         should_build_ubuntu_cpu="false"
@@ -75,7 +42,6 @@ jobs:
         if [[ "$operating_systems" == *"ubuntu"* ]]; then
           should_build_ubuntu_rocm="true"
           should_build_ubuntu_cpu="true"
-          echo "rocm_matrix=$matrix_targets" >> $GITHUB_OUTPUT
         fi
 
         if [[ "$operating_systems" == *"macos"* ]]; then
@@ -90,19 +56,23 @@ jobs:
         echo "Ubuntu CPU build: $should_build_ubuntu_cpu"
         echo "macOS build: $should_build_macos"
 
-  # ---------------------------------------------------------------------------
-  # Ubuntu + ROCm build (per GPU target)
-  # ---------------------------------------------------------------------------
   build-ubuntu-rocm:
     runs-on: ubuntu-22.04
     needs: prepare-matrix
     if: needs.prepare-matrix.outputs.should_build_ubuntu_rocm == 'true'
     strategy:
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.rocm_matrix) }}
       fail-fast: false
-    outputs:
-      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
-      rocm_channel: ${{ steps.set-outputs.outputs.rocm_channel }}
+      matrix:
+        include:
+          - channel: stable
+            rocm_version: "7.2.1"
+            rocm_source: github-release
+            release_repo: lemonade-sdk/rocm-stable
+            gpu_targets: "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
+          - channel: preview
+            rocm_version: "7.12.0"
+            rocm_source: amd-tarball
+            gpu_targets: "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
 
     steps:
     - name: Checkout repository
@@ -116,159 +86,28 @@ jobs:
         sudo apt-get install -y cmake ninja-build patchelf unzip curl \
           libcurl4-openssl-dev libopenblas-dev liblapacke-dev pkg-config
 
-    - name: Validate ROCm channel
+    - name: Install ROCm
       env:
-        CHANNEL: ${{ env.ROCM_CHANNEL }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # Allowlist: only 'preview' (7.2.1) or 'stable' (7.12.x) are accepted.
-        # Both channels must resolve to https://repo.radeon.com/rocm/apt/. Any
-        # other channel or source (distro packages, TheRock S3, nightlies, etc.)
-        # is rejected here before any install step runs.
-        case "$CHANNEL" in
-          preview|stable) ;;
-          *)
-            echo "::error::Unsupported ROCm channel '$CHANNEL'."
-            echo "::error::Allowed channels: preview (ROCm 7.2.1), stable (ROCm 7.12.x)."
-            echo "::error::Both channels are sourced from https://repo.radeon.com/rocm/apt/."
-            exit 1
-            ;;
-        esac
-        config_channels=$(jq -r '._allowed_channels | join(",")' .github/rocm-channels.json)
-        echo "Config allowlist: $config_channels"
-        echo "Selected channel: $CHANNEL"
+        sudo mkdir -p /opt/rocm
 
-    - name: Install ROCm (preview channel - 7.2.1 from AMD apt)
-      if: env.ROCM_CHANNEL == 'preview'
+        if [ "${{ matrix.rocm_source }}" = "github-release" ]; then
+          url="https://github.com/${{ matrix.release_repo }}/releases/download/v${{ matrix.rocm_version }}/rocm-${{ matrix.rocm_version }}-runtime-libs.tar.gz"
+        else
+          url="https://repo.amd.com/rocm/tarball/therock-dist-linux-gfx1151-${{ matrix.rocm_version }}.tar.gz"
+        fi
+
+        echo "Installing ROCm ${{ matrix.rocm_version }} from $url"
+        curl -fsSL "$url" | sudo tar -xzf - -C /opt/rocm --strip-components=1
+
+    - name: Set ROCm environment variables
       run: |
-        rocm_version=$(jq -r '.preview.version' .github/rocm-channels.json)
-        rocm_source=$(jq -r '.preview.source' .github/rocm-channels.json)
-        rocm_apt_url=$(jq -r '.preview.apt_url' .github/rocm-channels.json)
+        echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+        echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
 
-        if [ "$rocm_source" != "amd-apt" ]; then
-          echo "::error::preview channel source must be 'amd-apt', got '$rocm_source'"
-          exit 1
-        fi
-        if [ "$rocm_version" != "7.2.1" ]; then
-          echo "::error::preview channel version is pinned to 7.2.1, got '$rocm_version'"
-          exit 1
-        fi
-        case "$rocm_apt_url" in
-          https://repo.radeon.com/rocm/apt/*) ;;
-          *)
-            echo "::error::apt_url must point at https://repo.radeon.com/rocm/apt/, got '$rocm_apt_url'"
-            exit 1
-            ;;
-        esac
-
-        echo "Installing ROCm $rocm_version from AMD apt: $rocm_apt_url"
-
-        # Add AMD-official ROCm apt repository (repo.radeon.com).
-        sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-        wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
-          gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] ${rocm_apt_url} jammy main" \
-          | sudo tee /etc/apt/sources.list.d/rocm.list
-
-        # Pin packages to repo.radeon.com only - block any distro ROCm package.
-        printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
-          | sudo tee /etc/apt/preferences.d/rocm-pin-600
-
-        sudo apt-get update
-        sudo apt-get install -y \
-          hip-dev rocblas-dev hipblas-dev hipblaslt-dev rocsolver-dev \
-          rocthrust-dev rocprim-dev hiprand-dev rocrand-dev rocwmma-dev
-
-        echo "Installed ROCm preview: $rocm_version (source: $rocm_apt_url)"
-        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
-        echo "DETECTED_ROCM_CHANNEL=preview" >> $GITHUB_ENV
-
-    - name: Install ROCm (stable channel - 7.12.x from AMD apt)
-      if: env.ROCM_CHANNEL == 'stable'
-      run: |
-        version_prefix=$(jq -r '.stable.version_prefix' .github/rocm-channels.json)
-        rocm_source=$(jq -r '.stable.source' .github/rocm-channels.json)
-        apt_url_prefix=$(jq -r '.stable.apt_url_prefix' .github/rocm-channels.json)
-
-        if [ "$rocm_source" != "amd-apt" ]; then
-          echo "::error::stable channel source must be 'amd-apt', got '$rocm_source'"
-          exit 1
-        fi
-        if [ "$version_prefix" != "7.12" ]; then
-          echo "::error::stable channel version_prefix is pinned to 7.12, got '$version_prefix'"
-          exit 1
-        fi
-        case "$apt_url_prefix" in
-          https://repo.radeon.com/rocm/apt/*) ;;
-          *)
-            echo "::error::apt_url_prefix must point at https://repo.radeon.com/rocm/apt/, got '$apt_url_prefix'"
-            exit 1
-            ;;
-        esac
-
-        # Resolve latest 7.12.x patch version published at repo.radeon.com by
-        # parsing the deb-mirror directory listing. This is the single source of
-        # truth; no fallback to distro packages or nightly tarballs is allowed.
-        echo "Resolving latest 7.12.x at https://repo.radeon.com/rocm/apt/"
-        listing=$(curl -fsSL https://repo.radeon.com/rocm/apt/ || true)
-        resolved_version=$(echo "$listing" \
-          | grep -oE 'href="7\.12(\.[0-9]+)?/"' \
-          | sed -E 's/.*"(7\.12(\.[0-9]+)?)\/".*/\1/' \
-          | sort -V | tail -1)
-
-        if [ -z "$resolved_version" ]; then
-          echo "::error::ROCm 7.12.x is not yet published at https://repo.radeon.com/rocm/apt/."
-          echo "::error::The stable channel is pinned to AMD's official deb mirror; no"
-          echo "::error::fallback to distro packages or TheRock S3 nightlies is permitted."
-          echo "::error::Retry once AMD publishes 7.12. For local dev use the preview channel (7.2.1)."
-          exit 1
-        fi
-        rocm_apt_url="https://repo.radeon.com/rocm/apt/${resolved_version}"
-
-        echo "Resolved stable ROCm version: $resolved_version"
-        echo "Installing from AMD apt: $rocm_apt_url"
-
-        sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-        wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
-          gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] ${rocm_apt_url} jammy main" \
-          | sudo tee /etc/apt/sources.list.d/rocm.list
-
-        # Pin packages to repo.radeon.com only - block any distro ROCm package.
-        printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
-          | sudo tee /etc/apt/preferences.d/rocm-pin-600
-
-        sudo apt-get update
-        sudo apt-get install -y \
-          hip-dev rocblas-dev hipblas-dev hipblaslt-dev rocsolver-dev \
-          rocthrust-dev rocprim-dev hiprand-dev rocrand-dev rocwmma-dev
-
-        echo "Installed ROCm stable: $resolved_version (source: $rocm_apt_url)"
-        echo "DETECTED_ROCM_VERSION=$resolved_version" >> $GITHUB_ENV
-        echo "DETECTED_ROCM_CHANNEL=stable" >> $GITHUB_ENV
-
-    - name: Map GPU targets
-      id: map-targets
-      run: |
-        current_target="${{ matrix.gfx_target }}"
-        case "$current_target" in
-          gfx110X) mapped="gfx1100;gfx1101;gfx1102" ;;
-          gfx103X) mapped="gfx1030;gfx1031;gfx1032;gfx1034" ;;
-          gfx1151) mapped="gfx1151" ;;
-          gfx1150) mapped="gfx1150" ;;
-          gfx120X) mapped="gfx1200;gfx1201" ;;
-          gfx115X_gfx120X) mapped="gfx1150;gfx1151;gfx1200;gfx1201" ;;
-          *) mapped="$current_target" ;;
-        esac
-        echo "mapped_target=$mapped" >> $GITHUB_OUTPUT
-        echo "Mapped target: $mapped"
-
-    # Cache the MLX source tree that CMake FetchContent clones from
-    # NripeshN/mlx. The clone is pinned in CMakeLists.txt by GIT_TAG, so the
-    # CMakeLists.txt hash is the correct cache key — a source change there
-    # busts the cache, anything else is a hit. Saves ~1 GB over the wire
-    # and insulates us from GitHub-side 500s (see issue #18).
     - name: Cache FetchContent MLX source
       uses: actions/cache@v4
       with:
@@ -280,15 +119,20 @@ jobs:
     - name: Build MLX Engine + ROCm
       run: |
         export HIP_PATH=/opt/rocm
-        export PATH="/opt/rocm/bin:$PATH"
+        export ROCM_PATH=/opt/rocm
+        export PATH="/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH"
 
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
-          -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-          -DCMAKE_HIP_ARCHITECTURES="${{ steps.map-targets.outputs.mapped_target }}" \
+          -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/amdclang \
+          -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/amdclang++ \
+          -DCMAKE_PREFIX_PATH=/opt/rocm \
+          -DCMAKE_HIP_ARCHITECTURES="${{ matrix.gpu_targets }}" \
+          -DCMAKE_CXX_CLANG_TIDY= \
+          -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
+          -DMINJA_EXAMPLE_ENABLED=OFF \
           -DMLX_BUILD_ROCM=ON \
           -DMLX_LM_BUILD_TESTS=OFF \
           -DMLX_LM_BUILD_EXAMPLES=ON
@@ -299,17 +143,14 @@ jobs:
       run: |
         mkdir -p output
 
-        # Copy binaries
         cp build/server output/
         cp build/chat output/
         cp build/diagnose output/ 2>/dev/null || true
 
-        # Bundle small non-ROCm libs for portability (ROCm libs come from system install)
         for lib in libopenblas.so* liblapacke.so* libgfortran.so*; do
           cp /usr/lib/x86_64-linux-gnu/$lib output/ 2>/dev/null || true
         done
 
-        # Set RPATH: check local dir first, then system ROCm
         for binary in output/server output/chat output/diagnose; do
           if [ -f "$binary" ]; then
             patchelf --set-rpath '$ORIGIN:/opt/rocm/lib' "$binary" 2>/dev/null || true
@@ -319,22 +160,13 @@ jobs:
         echo "Packaged artifacts (no ROCm libs bundled — requires system ROCm):"
         ls -lh output/
 
-    - name: Set outputs
-      id: set-outputs
-      run: |
-        echo "rocm_version=${{ env.DETECTED_ROCM_VERSION }}" >> $GITHUB_OUTPUT
-        echo "rocm_channel=${{ env.ROCM_CHANNEL }}" >> $GITHUB_OUTPUT
-
     - name: Upload artifacts
       uses: actions/upload-artifact@v6
       with:
-        name: mlx-engine-ubuntu-rocm-${{ env.ROCM_CHANNEL }}-${{ matrix.gfx_target }}-x64
+        name: mlx-engine-ubuntu-rocm-${{ matrix.channel }}-x64
         path: output/
         retention-days: 30
 
-  # ---------------------------------------------------------------------------
-  # Ubuntu CPU-only build
-  # ---------------------------------------------------------------------------
   build-ubuntu-cpu:
     runs-on: ubuntu-22.04
     needs: prepare-matrix
@@ -366,6 +198,9 @@ jobs:
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_CLANG_TIDY= \
+          -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
+          -DMINJA_EXAMPLE_ENABLED=OFF \
           -DMLX_BUILD_ROCM=OFF \
           -DMLX_LM_BUILD_TESTS=ON \
           -DMLX_LM_BUILD_EXAMPLES=ON
@@ -385,7 +220,6 @@ jobs:
         cp build/chat output/
         cp build/diagnose output/ 2>/dev/null || true
 
-        # Bundle runtime libs for portability
         for lib in libopenblas.so* liblapacke.so* libgfortran.so*; do
           cp /usr/lib/x86_64-linux-gnu/$lib output/ 2>/dev/null || true
         done
@@ -397,9 +231,6 @@ jobs:
         path: output/
         retention-days: 30
 
-  # ---------------------------------------------------------------------------
-  # macOS build (Metal / CPU)
-  # ---------------------------------------------------------------------------
   build-macos:
     runs-on: macos-latest
     needs: prepare-matrix
@@ -429,6 +260,9 @@ jobs:
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_CLANG_TIDY= \
+          -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
+          -DMINJA_EXAMPLE_ENABLED=OFF \
           -DMLX_LM_BUILD_TESTS=ON \
           -DMLX_LM_BUILD_EXAMPLES=ON
 
@@ -454,9 +288,6 @@ jobs:
         path: output/
         retention-days: 30
 
-  # ---------------------------------------------------------------------------
-  # Create Release
-  # ---------------------------------------------------------------------------
   create-release:
     needs: [prepare-matrix, build-ubuntu-rocm, build-ubuntu-cpu, build-macos]
     runs-on: ubuntu-22.04
@@ -485,10 +316,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        channel="${{ env.ROCM_CHANNEL }}"
-        # Match tags for this channel: b1000-stable, b1001-preview, etc.
         existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' \
-          | grep -E "^b[0-9]{4}(-${channel})?$" | sed 's/-.*$//' | sort -V || echo "")
+          | grep -E "^b[0-9]{4}(-[a-z]+)?$" | sed 's/-.*$//' | sort -uV || echo "")
 
         if [ -z "$existing_tags" ]; then
           next_number=1000
@@ -500,7 +329,7 @@ jobs:
           echo "Highest existing tag: $highest_tag (number: $highest_number)"
         fi
 
-        TAG=$(printf "b%04d-${channel}" $next_number)
+        TAG=$(printf "b%04d" $next_number)
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
@@ -519,17 +348,10 @@ jobs:
       if: steps.check-tag.outputs.tag_exists == 'false'
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
-        targets="${{ env.GFX_TARGETS }}"
-        channel="${{ env.ROCM_CHANNEL }}"
 
-        echo "Processing artifacts for release $TAG (channel: $channel)"
-
-        # ROCm builds
-        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
-        for target in "${TARGET_ARRAY[@]}"; do
-          target=$(echo "$target" | xargs)
-          artifact_dir="./all-artifacts/mlx-engine-ubuntu-rocm-${channel}-${target}-x64"
-          archive_name="mlx-engine-${TAG}-ubuntu-rocm-${channel}-${target}-x64"
+        for channel in stable preview; do
+          artifact_dir="./all-artifacts/mlx-engine-ubuntu-rocm-${channel}-x64"
+          archive_name="mlx-engine-${TAG}-ubuntu-rocm-${channel}-x64"
           if [ -d "$artifact_dir" ]; then
             echo "Creating archive: ${archive_name}.zip"
             cd "$artifact_dir"
@@ -538,7 +360,6 @@ jobs:
           fi
         done
 
-        # CPU build
         if [ -d "./all-artifacts/mlx-engine-ubuntu-cpu-x64" ]; then
           echo "Creating archive: mlx-engine-${TAG}-ubuntu-cpu-x64.zip"
           cd "./all-artifacts/mlx-engine-ubuntu-cpu-x64"
@@ -546,7 +367,6 @@ jobs:
           cd ../../
         fi
 
-        # macOS build
         if [ -d "./all-artifacts/mlx-engine-macos-arm64" ]; then
           echo "Creating archive: mlx-engine-${TAG}-macos-arm64.zip"
           cd "./all-artifacts/mlx-engine-macos-arm64"
@@ -563,11 +383,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
-        ROCM_VERSION="${{ needs.build-ubuntu-rocm.outputs.rocm_version }}"
-        ROCM_CHANNEL="${{ needs.build-ubuntu-rocm.outputs.rocm_channel }}"
-        targets="${{ env.GFX_TARGETS }}"
 
-        # Collect all zip files
         upload_files=$(ls *.zip 2>/dev/null | tr '\n' ' ')
 
         if [ -z "$upload_files" ]; then
@@ -580,16 +396,14 @@ jobs:
         gh release create "$TAG" \
           --title "$TAG" \
           --notes "**Build Number**: $TAG
-        **ROCm Channel**: $ROCM_CHANNEL
-        **ROCm Version**: $ROCM_VERSION
-        **GPU Target(s)**: $targets
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
         MLX Engine binaries with ROCm, CPU, and macOS support.
         **Requires system ROCm installation** — ROCm libraries are not bundled.
 
         ### Downloads
-        - **Ubuntu ROCm**: mlx-engine-${TAG}-ubuntu-rocm-${ROCM_CHANNEL}-{target}-x64.zip
+        - **Ubuntu ROCm (stable)**: mlx-engine-${TAG}-ubuntu-rocm-stable-x64.zip
+        - **Ubuntu ROCm (preview)**: mlx-engine-${TAG}-ubuntu-rocm-preview-x64.zip
         - **Ubuntu CPU**: mlx-engine-${TAG}-ubuntu-cpu-x64.zip
         - **macOS ARM64**: mlx-engine-${TAG}-macos-arm64.zip" \
           $upload_files
