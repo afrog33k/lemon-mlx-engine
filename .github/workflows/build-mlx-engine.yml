@@ -57,6 +57,7 @@ jobs:
         echo "macOS build: $should_build_macos"
 
   build-ubuntu-rocm:
+    name: build-ubuntu-rocm (${{ matrix.channel }})
     runs-on: ubuntu-22.04
     needs: prepare-matrix
     if: needs.prepare-matrix.outputs.should_build_ubuntu_rocm == 'true'
