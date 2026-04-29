@@ -4,12 +4,18 @@
 #include <mlx-lm/llm/llm_factory.h>
 #include <mlx-lm/common/kv_cache.h>
 #include <mlx-lm/common/generate.h>
+#include <mlx-lm/common/quantized_linear.h>
 #include <mlx/mlx.h>
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <filesystem>
+#include <limits>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 #include <nlohmann/json.hpp>
 
 namespace mx = mlx::core;
@@ -75,24 +81,433 @@ static std::vector<std::string> find_safetensors(const std::string& dir) {
     return files;
 }
 
+static std::string read_text_file(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("failed to open file: " + path);
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+struct ForwardLogits {
+    mx::array last_logits = mx::array(0.0f);
+    int token_count = 0;
+    int argmax_token = -1;
+    float argmax_logit = 0.0f;
+    int runner_up_token = -1;
+    float runner_up_logit = 0.0f;
+    float argmax_margin = 0.0f;
+    std::string argmax_text;
+};
+
+static ForwardLogits run_forward_logits(
+    mlx_lm::ModelContext& ctx,
+    std::vector<mlx_lm::KVCache>& cache,
+    const std::vector<int>& tokens)
+{
+    if (tokens.empty()) {
+        throw std::runtime_error("forward input has zero tokens");
+    }
+
+    auto token_array = mx::array(
+        tokens.data(), {1, static_cast<int>(tokens.size())}, mx::int32);
+    mx::eval(token_array);
+    auto out = ctx.call_fn(mlx_lm::LMInput::Text(token_array), &cache, nullptr);
+    mx::eval(out.logits);
+
+    auto last = mx::slice(
+        out.logits,
+        {0, out.logits.shape(1) - 1, 0},
+        {1, out.logits.shape(1), out.logits.shape(2)});
+    last = mx::reshape(mx::astype(last, mx::float32), {-1});
+    mx::eval(last);
+
+    auto next = mx::argmax(last);
+    mx::eval(next);
+    int next_id = static_cast<int>(next.item<uint32_t>());
+
+    auto data = last.data<float>();
+    float runner_up_logit = -std::numeric_limits<float>::infinity();
+    int runner_up_token = -1;
+    for (int i = 0; i < last.size(); ++i) {
+        if (i == next_id) {
+            continue;
+        }
+        float value = data[i];
+        if (value > runner_up_logit) {
+            runner_up_logit = value;
+            runner_up_token = i;
+        }
+    }
+
+    ForwardLogits result;
+    result.last_logits = last;
+    result.token_count = static_cast<int>(tokens.size());
+    result.argmax_token = next_id;
+    result.argmax_logit = data[next_id];
+    result.runner_up_token = runner_up_token;
+    result.runner_up_logit = runner_up_logit;
+    result.argmax_margin = data[next_id] - runner_up_logit;
+    result.argmax_text = ctx.decode_fn({next_id});
+    return result;
+}
+
+static bool run_qforward_compare(
+    const std::string& model_path,
+    const std::string& prompt,
+    int steps,
+    float max_diff)
+{
+    if (!std::getenv("LEMON_MLX_GDN_ENABLE_HIP") &&
+        !std::getenv("LEMON_MLX_GDN_DISABLE_HIP")) {
+        setenv("LEMON_MLX_GDN_DISABLE_HIP", "1", 1);
+    }
+
+    std::cerr << "\n--- TEST: dequantized forward vs native quantized forward ---" << std::endl;
+    std::cerr << "[DIAG] qforward prompt_bytes=" << prompt.size() << std::endl;
+    std::cerr << "[DIAG] qforward steps=" << steps << std::endl;
+
+    mlx_lm::QuantizedWeightRegistry::instance().clear();
+    unsetenv("LEMON_MLX_QWEN35_KEEP_QUANTIZED");
+    setenv("LEMON_MLX_DEQUANTIZE_WEIGHTS", "1", 1);
+    std::cerr << "[DIAG] Loading dequantized reference model" << std::endl;
+    auto deq_ctx = mlx_lm::load_llm(model_path);
+    auto prompt_tokens = deq_ctx.encode_fn(prompt);
+    if (prompt_tokens.empty()) {
+        throw std::runtime_error("prompt encoded to zero tokens");
+    }
+    auto deq_cache = deq_ctx.new_cache_fn({});
+    auto deq = run_forward_logits(deq_ctx, deq_cache, prompt_tokens);
+
+    mlx_lm::QuantizedWeightRegistry::instance().clear();
+    unsetenv("LEMON_MLX_DEQUANTIZE_WEIGHTS");
+    setenv("LEMON_MLX_QWEN35_KEEP_QUANTIZED", "1", 1);
+    std::cerr << "[DIAG] Loading native quantized model" << std::endl;
+    auto quant_ctx = mlx_lm::load_llm(model_path);
+    auto quant_tokens = quant_ctx.encode_fn(prompt);
+    if (quant_tokens != prompt_tokens) {
+        throw std::runtime_error("dequantized and quantized tokenizers produced different prompt ids");
+    }
+    auto quant_cache = quant_ctx.new_cache_fn({});
+    auto quant = run_forward_logits(quant_ctx, quant_cache, prompt_tokens);
+
+    float worst_max = 0.0f;
+    float worst_mean = 0.0f;
+    float min_dequant_margin = std::numeric_limits<float>::infinity();
+    float worst_diff_over_margin = 0.0f;
+    bool same_argmax = true;
+    int first_mismatch_step = -1;
+    std::vector<int> next_input;
+
+    for (int step = 0; step < steps; ++step) {
+        auto diff = mx::abs(mx::subtract(deq.last_logits, quant.last_logits));
+        mx::eval(diff);
+        float observed_max = mx::max(diff).item<float>();
+        float observed_mean = mx::mean(diff).item<float>();
+        worst_max = std::max(worst_max, observed_max);
+        worst_mean = std::max(worst_mean, observed_mean);
+        min_dequant_margin = std::min(min_dequant_margin, deq.argmax_margin);
+        float margin_denom = std::max(deq.argmax_margin, 1e-6f);
+        worst_diff_over_margin = std::max(worst_diff_over_margin, observed_max / margin_denom);
+        bool step_same = deq.argmax_token == quant.argmax_token;
+        if (!step_same && first_mismatch_step < 0) {
+            first_mismatch_step = step;
+        }
+        same_argmax = same_argmax && step_same;
+
+        std::cerr << "[DIAG] QFORWARD_STEP step=" << step
+                  << " dequant_token=" << deq.argmax_token
+                  << " dequant_logit=" << deq.argmax_logit
+                  << " dequant_text=\"" << deq.argmax_text << "\""
+                  << " quant_token=" << quant.argmax_token
+                  << " quant_logit=" << quant.argmax_logit
+                  << " quant_text=\"" << quant.argmax_text << "\""
+                  << " dequant_margin=" << deq.argmax_margin
+                  << " quant_margin=" << quant.argmax_margin
+                  << " max_diff=" << observed_max
+                  << " mean_diff=" << observed_mean
+                  << " diff_over_dequant_margin=" << (observed_max / margin_denom)
+                  << " same_argmax=" << (step_same ? "1" : "0")
+                  << std::endl;
+
+        next_input.assign(1, deq.argmax_token);
+        deq = run_forward_logits(deq_ctx, deq_cache, next_input);
+        quant = run_forward_logits(quant_ctx, quant_cache, next_input);
+    }
+
+    bool within_diff = worst_max <= max_diff;
+    bool ok = same_argmax && within_diff;
+
+    std::cerr << "[DIAG] QFORWARD_PROMPT_TOKENS = " << prompt_tokens.size() << std::endl;
+    std::cerr << "[DIAG] QFORWARD_WORST_MAX_DIFF = " << worst_max << std::endl;
+    std::cerr << "[DIAG] QFORWARD_WORST_MEAN_DIFF = " << worst_mean << std::endl;
+    std::cerr << "[DIAG] QFORWARD_MIN_DEQUANT_MARGIN = " << min_dequant_margin << std::endl;
+    std::cerr << "[DIAG] QFORWARD_WORST_DIFF_OVER_MARGIN = " << worst_diff_over_margin << std::endl;
+    std::cerr << "[DIAG] QFORWARD_STATUS = " << (ok ? "ok" : "fail")
+              << " same_argmax=" << (same_argmax ? "1" : "0")
+              << " first_mismatch_step=" << first_mismatch_step
+              << " max_allowed=" << max_diff << std::endl;
+    return ok;
+}
+
+struct QMatmulTestResult {
+    std::string prefix;
+    float max_diff_ones = 0.0f;
+    float max_diff_random = 0.0f;
+    float max_diff_batch = 0.0f;
+    float worst_diff = 0.0f;
+};
+
+static std::pair<int, int> read_quantization_defaults(const std::string& model_path) {
+    int group_size = 32;
+    int bits = 4;
+    std::ifstream cfg(model_path + "/config.json");
+    if (cfg.is_open()) {
+        auto j = nlohmann::json::parse(cfg);
+        if (j.contains("quantization")) {
+            auto& q = j["quantization"];
+            if (q.contains("group_size")) group_size = q["group_size"];
+            if (q.contains("bits")) bits = q["bits"];
+        }
+    }
+    return {group_size, bits};
+}
+
+static std::vector<std::string> discover_qmatmul_prefixes(
+    const std::unordered_map<std::string, mx::array>& weights)
+{
+    std::vector<std::string> prefixes;
+    for (const auto& [key, _] : weights) {
+        const std::string suffix = ".scales";
+        if (key.size() <= suffix.size() ||
+            key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        auto prefix = key.substr(0, key.size() - suffix.size());
+        if (weights.count(prefix + ".weight") && weights.count(prefix + ".biases")) {
+            prefixes.push_back(prefix);
+        }
+    }
+    std::sort(prefixes.begin(), prefixes.end());
+    return prefixes;
+}
+
+static QMatmulTestResult run_qmatmul_probe(
+    const std::string& prefix,
+    const mx::array& w,
+    const mx::array& scales,
+    const mx::array& biases,
+    int group_size,
+    int bits,
+    bool verbose)
+{
+    mx::eval(w); mx::eval(scales); mx::eval(biases);
+
+    if (verbose) {
+        std::cerr << "[DIAG] prefix=" << prefix << std::endl;
+        std::cerr << "[DIAG] weight=" << w.shape() << " " << w.dtype()
+                  << " scales=" << scales.shape() << " biases=" << biases.shape() << std::endl;
+        print_stats("scales", scales);
+        print_stats("biases", biases);
+        std::cerr << "[DIAG] bits=" << bits << " group_size=" << group_size << std::endl;
+    }
+
+    auto deq = mx::dequantize(w, scales, biases, group_size, bits);
+    mx::eval(deq);
+    if (verbose) {
+        print_stats("dequantized_weight", deq);
+        print_vals("dequant row0", deq, 20);
+    }
+
+    int hidden = deq.shape(1);
+    QMatmulTestResult result;
+    result.prefix = prefix;
+
+    auto x1 = mx::ones({1, 1, hidden}, mx::bfloat16);
+    mx::eval(x1);
+    auto ref1 = mx::matmul(mx::astype(x1, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
+    mx::eval(ref1);
+    auto qmm1 = mx::quantized_matmul(x1, w, scales, biases, true, group_size, bits);
+    mx::eval(qmm1);
+    auto qmm1_f = mx::astype(qmm1, mx::float32);
+    mx::eval(qmm1_f);
+    auto d1 = mx::abs(mx::subtract(ref1, qmm1_f));
+    mx::eval(d1);
+    result.max_diff_ones = mx::max(d1).item<float>();
+
+    if (verbose) {
+        print_stats("REF(ones)", ref1);
+        print_vals("REF(ones)", ref1, 20);
+        print_stats("QMM(ones)", qmm1_f);
+        print_vals("QMM(ones)", qmm1_f, 20);
+        print_stats("DIFF(ones)", d1);
+        std::cerr << "[DIAG] MAX DIFF(ones) = " << result.max_diff_ones << std::endl;
+    }
+
+    auto x2 = mx::astype(mx::random::normal({1, 1, hidden}), mx::bfloat16);
+    mx::eval(x2);
+    auto ref2 = mx::matmul(mx::astype(x2, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
+    mx::eval(ref2);
+    auto qmm2 = mx::quantized_matmul(x2, w, scales, biases, true, group_size, bits);
+    mx::eval(qmm2);
+    auto qmm2_f = mx::astype(qmm2, mx::float32);
+    mx::eval(qmm2_f);
+    auto d2 = mx::abs(mx::subtract(ref2, qmm2_f));
+    mx::eval(d2);
+    result.max_diff_random = mx::max(d2).item<float>();
+
+    if (verbose) {
+        print_stats("DIFF(random)", d2);
+        std::cerr << "[DIAG] MAX DIFF(random) = " << result.max_diff_random << std::endl;
+    }
+
+    auto x3 = mx::astype(mx::random::normal({1, 3, hidden}), mx::bfloat16);
+    mx::eval(x3);
+    auto ref3 = mx::matmul(mx::astype(x3, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
+    mx::eval(ref3);
+    auto qmm3 = mx::quantized_matmul(x3, w, scales, biases, true, group_size, bits);
+    mx::eval(qmm3);
+    auto qmm3_f = mx::astype(qmm3, mx::float32);
+    mx::eval(qmm3_f);
+    auto d3 = mx::abs(mx::subtract(ref3, qmm3_f));
+    mx::eval(d3);
+    result.max_diff_batch = mx::max(d3).item<float>();
+
+    if (verbose) {
+        print_stats("DIFF(batch=3)", d3);
+        std::cerr << "[DIAG] MAX DIFF(batch=3) = " << result.max_diff_batch << std::endl;
+    }
+
+    result.worst_diff = std::max(result.max_diff_ones,
+                         std::max(result.max_diff_random, result.max_diff_batch));
+    return result;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model_path>" << std::endl;
-        return 1;
+    if (argc < 2 || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        std::cerr << "Usage: " << argv[0]
+                  << " <model_path> [--qmatmul-only] [--qmatmul-scan-all]"
+                  << " [--qmatmul-sanitize]"
+                  << " [--qmatmul-prefix NAME] [--qmatmul-max-diff N]"
+                  << " [--qforward-compare] [--qforward-prompt TEXT]"
+                  << " [--qforward-prompt-file PATH] [--qforward-steps N]"
+                  << " [--qforward-max-diff N]"
+                  << std::endl;
+        return argc < 2 ? 1 : 0;
     }
 
     std::string model_path = argv[1];
+    bool qmatmul_only = false;
+    bool qmatmul_scan_all = false;
+    bool qmatmul_sanitize = false;
+    std::string qmatmul_prefix;
+    float qmatmul_max_diff = std::numeric_limits<float>::infinity();
+    bool qforward_compare = false;
+    std::string qforward_prompt = "def add(x, y):\n    ";
+    std::string qforward_prompt_file;
+    int qforward_steps = 8;
+    float qforward_max_diff = std::numeric_limits<float>::infinity();
+    for (int i = 2; i < argc; ++i) {
+        std::string flag = argv[i];
+        if (flag == "--qmatmul-only") {
+            qmatmul_only = true;
+        } else if (flag == "--qmatmul-scan-all") {
+            qmatmul_scan_all = true;
+        } else if (flag == "--qmatmul-sanitize") {
+            qmatmul_sanitize = true;
+        } else if (flag == "--qmatmul-prefix") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qmatmul-prefix" << std::endl;
+                return 1;
+            }
+            qmatmul_prefix = argv[++i];
+        } else if (flag == "--qmatmul-max-diff") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qmatmul-max-diff" << std::endl;
+                return 1;
+            }
+            qmatmul_max_diff = std::stof(argv[++i]);
+        } else if (flag == "--qforward-compare") {
+            qforward_compare = true;
+        } else if (flag == "--qforward-prompt") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qforward-prompt" << std::endl;
+                return 1;
+            }
+            qforward_prompt = argv[++i];
+        } else if (flag == "--qforward-prompt-file") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qforward-prompt-file" << std::endl;
+                return 1;
+            }
+            qforward_prompt_file = argv[++i];
+        } else if (flag == "--qforward-steps") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qforward-steps" << std::endl;
+                return 1;
+            }
+            qforward_steps = std::stoi(argv[++i]);
+        } else if (flag == "--qforward-max-diff") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --qforward-max-diff" << std::endl;
+                return 1;
+            }
+            qforward_max_diff = std::stof(argv[++i]);
+        } else if (flag == "--help" || flag == "-h") {
+            std::cerr << "Usage: " << argv[0]
+                      << " <model_path> [--qmatmul-only] [--qmatmul-scan-all]"
+                      << " [--qmatmul-sanitize]"
+                      << " [--qmatmul-prefix NAME] [--qmatmul-max-diff N]"
+                      << " [--qforward-compare] [--qforward-prompt TEXT]"
+                      << " [--qforward-prompt-file PATH] [--qforward-steps N]"
+                      << " [--qforward-max-diff N]"
+                      << std::endl;
+            return 0;
+        } else {
+            std::cerr << "unknown flag: " << flag << std::endl;
+            return 1;
+        }
+    }
+    if (qmatmul_scan_all && !qmatmul_prefix.empty()) {
+        std::cerr << "--qmatmul-scan-all cannot be combined with --qmatmul-prefix" << std::endl;
+        return 1;
+    }
+    if (qforward_compare && qmatmul_only) {
+        std::cerr << "--qforward-compare cannot be combined with --qmatmul-only" << std::endl;
+        return 1;
+    }
+    if (!qforward_prompt_file.empty()) {
+        qforward_prompt = read_text_file(qforward_prompt_file);
+    }
+    if (qforward_steps < 1) {
+        std::cerr << "--qforward-steps must be >= 1" << std::endl;
+        return 1;
+    }
     std::cerr << "=== INFERENCE PIPELINE DIAGNOSTICS ===" << std::endl;
     std::cerr << "Loading model: " << model_path << std::endl;
 
-    auto ctx = mlx_lm::load_llm(model_path);
-    std::cerr << "Model loaded.\n" << std::endl;
+    std::optional<mlx_lm::ModelContext> ctx;
+    if ((!qmatmul_only && !qforward_compare) || qmatmul_sanitize) {
+        ctx.emplace(mlx_lm::load_llm(model_path));
+        std::cerr << "Model loaded.\n" << std::endl;
+    } else if (qforward_compare) {
+        std::cerr << "Skipping default model load for qforward comparison.\n" << std::endl;
+    } else {
+        std::cerr << "Skipping full model load for qmatmul-only diagnostic.\n" << std::endl;
+    }
+
+    if (qforward_compare) {
+        return run_qforward_compare(
+            model_path, qforward_prompt, qforward_steps, qforward_max_diff) ? 0 : 2;
+    }
 
     // =========================================================
     // TEST 1: Basic GPU ops sanity check
     // =========================================================
-    std::cerr << "--- TEST 1: Basic GPU ops ---" << std::endl;
-    {
+    if (!qmatmul_only) {
+        std::cerr << "--- TEST 1: Basic GPU ops ---" << std::endl;
         auto a = mx::ones({4, 4}, mx::float32);
         auto b = mx::full({4, 4}, 2.0f, mx::float32);
         auto c = mx::matmul(a, b);
@@ -112,106 +527,86 @@ int main(int argc, char* argv[]) {
     // TEST 2: Quantized matmul — compare GPU vs dequant+matmul
     // =========================================================
     std::cerr << "\n--- TEST 2: quantized_matmul vs dequant ---" << std::endl;
+    float qmatmul_worst_diff = 0.0f;
     {
         auto st_files = find_safetensors(model_path);
         if (st_files.empty()) {
             std::cerr << "[DIAG] No safetensors found!" << std::endl;
+            qmatmul_worst_diff = std::numeric_limits<float>::infinity();
         } else {
-            // Load weights from safetensors files
-            mx::array w_arr = mx::array(0);
-            mx::array scales_arr = mx::array(0);
-            mx::array biases_arr = mx::array(0);
-            bool found_w = false, found_s = false, found_b = false;
-            std::string prefix = "model.layers.0.self_attn.q_proj";
+            auto [group_size, bits] = read_quantization_defaults(model_path);
+            std::cerr << "[DIAG] bits=" << bits << " group_size=" << group_size << std::endl;
+            bool found_any = false;
+            std::vector<std::string> candidate_prefixes;
+            if (!qmatmul_prefix.empty()) {
+                candidate_prefixes.push_back(qmatmul_prefix);
+            } else if (!qmatmul_scan_all) {
+                candidate_prefixes = {
+                    "model.layers.0.self_attn.q_proj",
+                    "model.layers.0.linear_attn.in_proj_qkv",
+                    "language_model.model.layers.0.self_attn.q_proj",
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                    "language_model.model.layers.0.mlp.gate_proj",
+                };
+            }
 
             for (auto& f : st_files) {
                 auto [ww, meta] = mx::load_safetensors(f);
-                for (auto& [k, v] : ww) {
-                    if (k == prefix + ".weight") { w_arr = v; found_w = true; }
-                    if (k == prefix + ".scales") { scales_arr = v; found_s = true; }
-                    if (k == prefix + ".biases") { biases_arr = v; found_b = true; }
+                if (qmatmul_sanitize) {
+                    if (!ctx.has_value()) {
+                        throw std::runtime_error("--qmatmul-sanitize requires a loaded model context");
+                    }
+                    ww = ctx->sanitize_fn(std::move(ww));
                 }
-                if (found_w) break;
-            }
-
-            if (found_w && found_s && found_b) {
-                auto w = w_arr;
-                auto scales = scales_arr;
-                auto biases = biases_arr;
-                mx::eval(w); mx::eval(scales); mx::eval(biases);
-
-                std::cerr << "[DIAG] weight=" << w.shape() << " " << w.dtype()
-                          << " scales=" << scales.shape() << " biases=" << biases.shape() << std::endl;
-                print_stats("scales", scales);
-                print_stats("biases", biases);
-
-                int group_size = 32, bits = 4;
-                {
-                    std::ifstream cfg(model_path + "/config.json");
-                    if (cfg.is_open()) {
-                        auto j = nlohmann::json::parse(cfg);
-                        if (j.contains("quantization")) {
-                            auto& q = j["quantization"];
-                            if (q.contains("group_size")) group_size = q["group_size"];
-                            if (q.contains("bits")) bits = q["bits"];
-                        }
+                auto prefixes = qmatmul_scan_all ? discover_qmatmul_prefixes(ww) : candidate_prefixes;
+                for (const auto& prefix : prefixes) {
+                    auto w_it = ww.find(prefix + ".weight");
+                    auto s_it = ww.find(prefix + ".scales");
+                    auto b_it = ww.find(prefix + ".biases");
+                    if (w_it == ww.end() || s_it == ww.end() || b_it == ww.end()) {
+                        continue;
+                    }
+                    found_any = true;
+                    bool verbose = !qmatmul_scan_all;
+                    auto result = run_qmatmul_probe(
+                        prefix, w_it->second, s_it->second, b_it->second,
+                        group_size, bits, verbose);
+                    qmatmul_worst_diff = std::max(qmatmul_worst_diff, result.worst_diff);
+                    if (qmatmul_scan_all) {
+                        std::cerr << "[DIAG] QMATMUL_ROW"
+                                  << " prefix=" << result.prefix
+                                  << " ones=" << result.max_diff_ones
+                                  << " random=" << result.max_diff_random
+                                  << " batch3=" << result.max_diff_batch
+                                  << " worst=" << result.worst_diff
+                                  << " status=" << ((result.worst_diff <= qmatmul_max_diff) ? "ok" : "fail")
+                                  << std::endl;
+                    } else {
+                        std::cerr << "[DIAG] QMATMUL_WORST_DIFF = "
+                                  << qmatmul_worst_diff << std::endl;
+                        break;
                     }
                 }
-                std::cerr << "[DIAG] bits=" << bits << " group_size=" << group_size << std::endl;
+                if (found_any && !qmatmul_scan_all) break;
+            }
 
-                // Dequantize
-                auto deq = mx::dequantize(w, scales, biases, group_size, bits);
-                mx::eval(deq);
-                print_stats("dequantized_q_proj", deq);
-                print_vals("dequant row0", deq, 20);
-
-                int hidden = deq.shape(1);
-
-                // Test A: ones input
-                auto x1 = mx::ones({1, 1, hidden}, mx::bfloat16);
-                mx::eval(x1);
-                auto ref1 = mx::matmul(mx::astype(x1, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
-                mx::eval(ref1);
-                auto qmm1 = mx::quantized_matmul(x1, w, scales, biases, true, group_size, bits);
-                mx::eval(qmm1);
-                auto qmm1_f = mx::astype(qmm1, mx::float32);
-                mx::eval(qmm1_f);
-                print_stats("REF(ones)", ref1);
-                print_vals("REF(ones)", ref1, 20);
-                print_stats("QMM(ones)", qmm1_f);
-                print_vals("QMM(ones)", qmm1_f, 20);
-                auto d1 = mx::abs(mx::subtract(ref1, qmm1_f));
-                mx::eval(d1);
-                print_stats("DIFF(ones)", d1);
-                std::cerr << "[DIAG] MAX DIFF(ones) = " << mx::max(d1).item<float>() << std::endl;
-
-                // Test B: random input
-                auto x2 = mx::astype(mx::random::normal({1, 1, hidden}), mx::bfloat16);
-                mx::eval(x2);
-                auto ref2 = mx::matmul(mx::astype(x2, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
-                mx::eval(ref2);
-                auto qmm2 = mx::quantized_matmul(x2, w, scales, biases, true, group_size, bits);
-                mx::eval(qmm2);
-                auto qmm2_f = mx::astype(qmm2, mx::float32);
-                mx::eval(qmm2_f);
-                print_stats("DIFF(random)", mx::abs(mx::subtract(ref2, qmm2_f)));
-                std::cerr << "[DIAG] MAX DIFF(random) = " << mx::max(mx::abs(mx::subtract(ref2, qmm2_f))).item<float>() << std::endl;
-
-                // Test C: batch=3 (prefill path)
-                auto x3 = mx::astype(mx::random::normal({1, 3, hidden}), mx::bfloat16);
-                mx::eval(x3);
-                auto ref3 = mx::matmul(mx::astype(x3, mx::float32), mx::transpose(mx::astype(deq, mx::float32)));
-                mx::eval(ref3);
-                auto qmm3 = mx::quantized_matmul(x3, w, scales, biases, true, group_size, bits);
-                mx::eval(qmm3);
-                auto qmm3_f = mx::astype(qmm3, mx::float32);
-                mx::eval(qmm3_f);
-                print_stats("DIFF(batch=3)", mx::abs(mx::subtract(ref3, qmm3_f)));
-                std::cerr << "[DIAG] MAX DIFF(batch=3) = " << mx::max(mx::abs(mx::subtract(ref3, qmm3_f))).item<float>() << std::endl;
-            } else {
-                std::cerr << "[DIAG] q_proj weights not found (w=" << found_w << " s=" << found_s << " b=" << found_b << ")" << std::endl;
+            if (!found_any) {
+                std::cerr << "[DIAG] quantized weight prefix not found" << std::endl;
+                qmatmul_worst_diff = std::numeric_limits<float>::infinity();
             }
         }
+    }
+    if (qmatmul_only) {
+        if (!(qmatmul_worst_diff <= qmatmul_max_diff)) {
+            std::cerr << "[DIAG] QMATMUL_STATUS = fail"
+                      << " worst_diff=" << qmatmul_worst_diff
+                      << " max_allowed=" << qmatmul_max_diff << std::endl;
+            return 2;
+        }
+        std::cerr << "[DIAG] QMATMUL_STATUS = ok"
+                  << " worst_diff=" << qmatmul_worst_diff
+                  << " max_allowed=" << qmatmul_max_diff << std::endl;
+        return 0;
     }
 
     // =========================================================
@@ -262,9 +657,9 @@ int main(int argc, char* argv[]) {
         int tok_val = 1;
         auto tok = mx::array(&tok_val, {1, 1}, mx::int32);
         mx::eval(tok);
-        auto cache = ctx.new_cache_fn({});
+        auto cache = ctx->new_cache_fn({});
         mlx_lm::LMInput::Text text(tok);
-        auto out = ctx.call_fn(text, &cache, nullptr);
+        auto out = ctx->call_fn(text, &cache, nullptr);
         mx::eval(out.logits);
         print_stats("logits(token=1)", out.logits);
         print_vals("logits(token=1)", out.logits, 30);
@@ -289,7 +684,7 @@ int main(int argc, char* argv[]) {
         auto tok2 = mx::array(&next, {1, 1}, mx::int32);
         mx::eval(tok2);
         mlx_lm::LMInput::Text text2(tok2);
-        auto out2 = ctx.call_fn(text2, &cache, nullptr);
+        auto out2 = ctx->call_fn(text2, &cache, nullptr);
         mx::eval(out2.logits);
         print_stats("logits(step2)", out2.logits);
     }
@@ -318,10 +713,10 @@ int main(int argc, char* argv[]) {
         mlx_lm::GenerateParameters warmup_params;
         warmup_params.max_tokens = 1;
         warmup_params.temperature = 0.0f;
-        auto warmup_cache = ctx.new_cache_fn(warmup_params);
+        auto warmup_cache = ctx->new_cache_fn(warmup_params);
         auto dummy_tokens = mx::reshape(mx::array({1}), {1, 1});
         mlx_lm::LMInput::Text warmup_text(dummy_tokens);
-        auto warmup_out = ctx.call_fn(warmup_text, &warmup_cache, nullptr);
+        auto warmup_out = ctx->call_fn(warmup_text, &warmup_cache, nullptr);
         mx::eval(warmup_out.logits);
         print_stats("warmup logits", warmup_out.logits);
         std::cerr << "[DIAG] Warmup complete" << std::endl;
@@ -334,7 +729,7 @@ int main(int argc, char* argv[]) {
     {
         // Encode a prompt the same way chat.cpp does
         std::string prompt = "What is 2+2?";
-        auto prompt_tokens = ctx.encode_fn(prompt);
+        auto prompt_tokens = ctx->encode_fn(prompt);
         std::cerr << "[DIAG] encode(\"" << prompt << "\") = [";
         for (size_t i = 0; i < prompt_tokens.size(); i++) {
             if (i > 0) std::cerr << ", ";
@@ -345,19 +740,19 @@ int main(int argc, char* argv[]) {
         // Decode each token back to verify tokenizer round-trip
         std::cerr << "[DIAG] Token-by-token decode:" << std::endl;
         for (size_t i = 0; i < prompt_tokens.size(); i++) {
-            auto decoded = ctx.decode_fn({prompt_tokens[i]});
+            auto decoded = ctx->decode_fn({prompt_tokens[i]});
             std::cerr << "  token " << prompt_tokens[i] << " -> \"" << decoded << "\"" << std::endl;
         }
 
         // Also try chat template if available
-        if (ctx.apply_chat_template_fn) {
+        if (ctx->apply_chat_template_fn) {
             std::vector<std::unordered_map<std::string, std::string>> messages = {
                 {{"role", "user"}, {"content", prompt}}
             };
-            if (ctx.template_extra_context) {
-                (*ctx.template_extra_context)["enable_thinking"] = false;
+            if (ctx->template_extra_context) {
+                (*ctx->template_extra_context)["enable_thinking"] = false;
             }
-            auto tmpl_tokens = ctx.apply_chat_template_fn(messages);
+            auto tmpl_tokens = ctx->apply_chat_template_fn(messages);
             std::cerr << "[DIAG] Chat template tokens (" << tmpl_tokens.size() << "): [";
             for (size_t i = 0; i < tmpl_tokens.size() && i < 50; i++) {
                 if (i > 0) std::cerr << ", ";
@@ -367,17 +762,17 @@ int main(int argc, char* argv[]) {
             std::cerr << "]" << std::endl;
 
             // Decode the full template back to text
-            auto tmpl_text = ctx.decode_fn(tmpl_tokens);
+            auto tmpl_text = ctx->decode_fn(tmpl_tokens);
             std::cerr << "[DIAG] Chat template decoded: \"" << tmpl_text << "\"" << std::endl;
 
             // Now do generation step by step
             auto tok_arr = mx::array(tmpl_tokens.data(), {1, static_cast<int>(tmpl_tokens.size())}, mx::int32);
             mx::eval(tok_arr);
-            auto cache = ctx.new_cache_fn({});
+            auto cache = ctx->new_cache_fn({});
             mlx_lm::LMInput::Text text(tok_arr);
 
             // Prefill
-            auto out = ctx.call_fn(text, &cache, nullptr);
+            auto out = ctx->call_fn(text, &cache, nullptr);
             mx::eval(out.logits);
             print_stats("prefill logits", out.logits);
 
@@ -392,7 +787,7 @@ int main(int argc, char* argv[]) {
                 mx::eval(next_id_arr);
                 int next_id = next_id_arr.item<uint32_t>();
 
-                auto decoded = ctx.decode_fn({next_id});
+                auto decoded = ctx->decode_fn({next_id});
                 std::cerr << "  step=" << step << " token=" << next_id << " text=\"" << decoded << "\"" << std::endl;
                 full_output += decoded;
 
@@ -400,7 +795,7 @@ int main(int argc, char* argv[]) {
                 auto next_tok = mx::array(&next_id, {1, 1}, mx::int32);
                 mx::eval(next_tok);
                 mlx_lm::LMInput::Text next_text(next_tok);
-                out = ctx.call_fn(next_text, &cache, nullptr);
+                out = ctx->call_fn(next_text, &cache, nullptr);
                 mx::eval(out.logits);
             }
             std::cerr << "[DIAG] Full output (argmax): \"" << full_output << "\"" << std::endl;
@@ -410,9 +805,9 @@ int main(int argc, char* argv[]) {
             {
                 auto tok_arr2 = mx::array(tmpl_tokens.data(), {1, static_cast<int>(tmpl_tokens.size())}, mx::int32);
                 mx::eval(tok_arr2);
-                auto cache2 = ctx.new_cache_fn({});
+                auto cache2 = ctx->new_cache_fn({});
                 mlx_lm::LMInput::Text text2(tok_arr2);
-                auto out2 = ctx.call_fn(text2, &cache2, nullptr);
+                auto out2 = ctx->call_fn(text2, &cache2, nullptr);
                 mx::eval(out2.logits);
 
                 std::string cat_output;
@@ -426,14 +821,14 @@ int main(int argc, char* argv[]) {
                     mx::eval(sampled);
                     int next_id2 = sampled.item<uint32_t>();
 
-                    auto decoded2 = ctx.decode_fn({next_id2});
+                    auto decoded2 = ctx->decode_fn({next_id2});
                     std::cerr << "  step=" << step << " token=" << next_id2 << " text=\"" << decoded2 << "\"" << std::endl;
                     cat_output += decoded2;
 
                     auto next_tok2 = mx::array(&next_id2, {1, 1}, mx::int32);
                     mx::eval(next_tok2);
                     mlx_lm::LMInput::Text next_text2(next_tok2);
-                    out2 = ctx.call_fn(next_text2, &cache2, nullptr);
+                    out2 = ctx->call_fn(next_text2, &cache2, nullptr);
                     mx::eval(out2.logits);
                 }
                 std::cerr << "[DIAG] Full output (categorical): \"" << cat_output << "\"" << std::endl;
@@ -451,13 +846,13 @@ int main(int argc, char* argv[]) {
                 gen_params.top_p = 0.9f;
 
                 std::set<int> eos_set;
-                if (ctx.eos_token_ids.has_value()) {
-                    for (int id : ctx.eos_token_ids.value()) eos_set.insert(id);
+                if (ctx->eos_token_ids.has_value()) {
+                    for (int id : ctx->eos_token_ids.value()) eos_set.insert(id);
                 }
 
                 std::string gen_output;
                 auto info = mlx_lm::generate_text(
-                    ctx, lm_input, gen_params, eos_set,
+                    *ctx, lm_input, gen_params, eos_set,
                     [&](const std::string& text, int token) {
                         std::cerr << "  token=" << token << " text=\"" << text << "\"" << std::endl;
                         gen_output += text;
@@ -505,9 +900,9 @@ int main(int argc, char* argv[]) {
             auto tok_arr = mx::array(std::vector<int>{151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271}.data(),
                 {1, 19}, mx::int32);
             mx::eval(tok_arr);
-            auto cache_t8 = ctx.new_cache_fn({});
+            auto cache_t8 = ctx->new_cache_fn({});
             mlx_lm::LMInput::Text text_t8(tok_arr);
-            auto out_t8 = ctx.call_fn(text_t8, &cache_t8, nullptr);
+            auto out_t8 = ctx->call_fn(text_t8, &cache_t8, nullptr);
             mx::eval(out_t8.logits);
 
             auto last_logits = mx::slice(out_t8.logits, {0, 18, 0}, {1, 19, 151936});

@@ -5,16 +5,23 @@
 
 #include <mlx-lm/common/gated_delta.h>
 #include <mlx/fast.h>
+#include <cstdlib>
 
 namespace mx = mlx::core;
 
 namespace mlx_lm {
 
+static bool gdn_env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
 // ---------------------------------------------------------------------------
 // Fused HIP kernel for gated delta recurrence.
 // Ports the Metal kernel from GatedDelta.swift to HIP/ROCm.
-// Grid: (32, Dv, B*Hv), ThreadGroup: (32, 4, 1)
-// Each wave32 thread handles Dk/32 state elements, uses warp shuffle for reduction.
+// Grid: (1, ceil(Dv/4), B*Hv), ThreadGroup: (32, 4, 1)
+// Each threadIdx.y row handles one Dv row. Reductions use shared memory so the
+// result is independent of whether the device schedules wave32 or wave64.
 // ---------------------------------------------------------------------------
 static const char* gdn_hip_source = R"(
     // Thread indexing (HIP equivalent of Metal thread_position_in_grid)
@@ -35,6 +42,7 @@ static const char* gdn_hip_source = R"(
 
     auto dk_idx = threadIdx.x;  // thread_position_in_threadgroup.x
     auto dv_idx = blockIdx.y * blockDim.y + threadIdx.y;  // thread_position_in_grid.y
+    if (dv_idx >= Dv) return;
 
     // g, beta: [B, T, Hv]
     auto g_ = g + b_idx * T_val * Hv;
@@ -43,6 +51,7 @@ static const char* gdn_hip_source = R"(
     // state_in, state_out: [B, Hv, Dv, Dk]
     auto i_state = state_in + (n * Dv + dv_idx) * Dk;
     auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+    __shared__ float row_reduce[4][32];
 
     // Load state into registers (float32 accumulation)
     float state[n_per_t];
@@ -59,9 +68,16 @@ static const char* gdn_hip_source = R"(
             state[i] = state[i] * static_cast<float>(g_[hv_idx]);
             kv_mem += state[i] * static_cast<float>(k_[s_idx]);
         }
-        // Wave32 reduction (RDNA warp size = 32)
-        for (int offset = 16; offset > 0; offset >>= 1)
-            kv_mem += __shfl_xor(kv_mem, offset);
+        row_reduce[threadIdx.y][threadIdx.x] = kv_mem;
+        __syncthreads();
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            if (threadIdx.x < offset) {
+                row_reduce[threadIdx.y][threadIdx.x] +=
+                    row_reduce[threadIdx.y][threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+        kv_mem = row_reduce[threadIdx.y][0];
 
         auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
                      * static_cast<float>(beta_[hv_idx]);
@@ -73,8 +89,16 @@ static const char* gdn_hip_source = R"(
             state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
             out += state[i] * static_cast<float>(q_[s_idx]);
         }
-        for (int offset = 16; offset > 0; offset >>= 1)
-            out += __shfl_xor(out, offset);
+        row_reduce[threadIdx.y][threadIdx.x] = out;
+        __syncthreads();
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            if (threadIdx.x < offset) {
+                row_reduce[threadIdx.y][threadIdx.x] +=
+                    row_reduce[threadIdx.y][threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+        out = row_reduce[threadIdx.y][0];
 
         // Lane 0 writes the output
         if (threadIdx.x == 0) {
@@ -128,8 +152,8 @@ static std::pair<mx::array, mx::array> gated_delta_kernel(
         {q, k, v, g, beta, state, mx::array(T)},
         {{B, T, Hv, Dv}, state.shape()},
         {input_type, input_type},
-        {32, Dv, B * Hv},      // grid
-        {32, 4, 1},             // threadGroup
+        {1, (Dv + 3) / 4, B * Hv},  // grid; block.y covers four Dv rows
+        {32, 4, 1},                 // threadGroup
         {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
         std::nullopt,           // init_value
         true,                   // ensure_row_contiguous
@@ -147,7 +171,9 @@ mx::array compute_gated_delta_g(
     static auto compiled = mx::compile(
         [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
             auto a_log_f32 = mx::astype(inputs[0], mx::float32);
-            auto softplus_val = mx::log(mx::add(mx::exp(mx::add(inputs[1], inputs[2])), mx::array(1.0f)));
+            auto a_f32 = mx::astype(inputs[1], mx::float32);
+            auto dt_bias_f32 = mx::astype(inputs[2], mx::float32);
+            auto softplus_val = mx::log(mx::add(mx::exp(mx::add(a_f32, dt_bias_f32)), mx::array(1.0f)));
             auto decay = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), softplus_val)));
             return {mx::astype(decay, inputs[1].dtype())};
         },
@@ -162,7 +188,9 @@ static auto compiled_beta_and_g = mx::compile(
     [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
         auto beta = mx::sigmoid(inputs[0]);
         auto a_log_f32 = mx::astype(inputs[1], mx::float32);
-        auto softplus_val = mx::log(mx::add(mx::exp(mx::add(inputs[2], inputs[3])), mx::array(1.0f)));
+        auto a_f32 = mx::astype(inputs[2], mx::float32);
+        auto dt_bias_f32 = mx::astype(inputs[3], mx::float32);
+        auto softplus_val = mx::log(mx::add(mx::exp(mx::add(a_f32, dt_bias_f32)), mx::array(1.0f)));
         auto g = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), softplus_val)));
         g = mx::astype(g, inputs[1].dtype());
         return {beta, g};
@@ -309,8 +337,12 @@ std::pair<mx::array, mx::array> gated_delta_ops(
     int repeat_factor = Hv / Hk;
     auto s = state.value_or(mx::zeros({B, Hv, Dv, Dk}, q.dtype()));
 
-    // Try fused HIP kernel (handles all T, no mask)
-    if (!mask.has_value() && Dk % 32 == 0) {
+    // The HIP recurrence kernel is fast but still experimental on gfx1151; keep
+    // correctness defaulting to the compiled MLX recurrence unless explicitly
+    // requested for kernel studies.
+    if (gdn_env_enabled("LEMON_MLX_GDN_ENABLE_HIP") &&
+        !gdn_env_enabled("LEMON_MLX_GDN_DISABLE_HIP") &&
+        !mask.has_value() && Dk % 32 == 0) {
         auto q_work = repeat_heads(q, repeat_factor);
         auto k_work = repeat_heads(k, repeat_factor);
         return gated_delta_kernel(q_work, k_work, v, g, beta, s);

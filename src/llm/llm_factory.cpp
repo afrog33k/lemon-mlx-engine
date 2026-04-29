@@ -58,6 +58,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 
@@ -78,6 +79,12 @@ using LLMLoaderFn = std::function<ModelContext(
     std::unordered_map<std::string, mlx::core::array> weights,
     const BaseConfiguration& base_config)>;
 
+static bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' &&
+           !(value[0] == '0' && value[1] == '\0');
+}
+
 template <typename Config, typename Model>
 static ModelContext load_typed_model(
     const std::string& config_json,
@@ -90,11 +97,44 @@ static ModelContext load_typed_model(
 
     weights = model->sanitize(std::move(weights));
 
-    // Register quantized weights in the QuantizedWeightRegistry.
-    // This maps model member array addresses → quantization metadata so
-    // that linear_fwd() uses mx::quantized_matmul at inference time.
     auto wmap = model->weight_map();
-    register_quantized_weights(weights, base_config, wmap);
+
+    const bool force_dequantize = env_flag_enabled("LEMON_MLX_DEQUANTIZE_WEIGHTS");
+
+    if (force_dequantize) {
+        weights = dequantize_weights(std::move(weights), base_config);
+    } else {
+        // Register quantized weights in the QuantizedWeightRegistry.
+        // This maps model member array addresses → quantization metadata so
+        // that linear_fwd() uses mx::quantized_matmul at inference time.
+        register_quantized_weights(weights, base_config, wmap);
+    }
+
+    if (const char* debug = std::getenv("LEMON_MLX_DEBUG_WEIGHTS");
+        debug != nullptr && debug[0] == '1' && debug[1] == '\0') {
+        size_t matched = 0;
+        for (const auto& [name, target] : wmap) {
+            (void)target;
+            if (weights.find(name) != weights.end()) {
+                ++matched;
+            } else {
+                std::cerr << "[weights] missing: " << name << "\n";
+            }
+        }
+        size_t extras = 0;
+        for (const auto& [name, value] : weights) {
+            (void)value;
+            if (wmap.find(name) == wmap.end()) {
+                if (extras < 64) {
+                    std::cerr << "[weights] unused: " << name << "\n";
+                }
+                ++extras;
+            }
+        }
+        std::cerr << "[weights] matched=" << matched
+                  << " expected=" << wmap.size()
+                  << " unused=" << extras << "\n";
+    }
 
     model->load_weights(weights);
 

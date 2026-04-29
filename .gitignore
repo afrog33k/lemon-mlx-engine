@@ -1,9 +1,12 @@
 # Build
 build/
+build-*/
 build-npu/
 cmake-build-*/
 out/
 .cache/
+.hipfire_kernels/
+.codeinsight+research/
 
 # IDE
 .idea/

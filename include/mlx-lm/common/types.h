@@ -69,10 +69,7 @@ struct LMInput {
 struct LMOutput {
 
     struct State {
-        std::optional<mlx::core::array> cross_attention_states;
-
-        State(std::optional<mlx::core::array> cross_attention_states = std::nullopt)
-            : cross_attention_states(std::move(cross_attention_states)) {}
+        State() = default;
     };
 
     mlx::core::array logits;

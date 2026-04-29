@@ -1,0 +1,17 @@
+diff --git a/mlx/backend/rocm/quantized/qmm.hip b/mlx/backend/rocm/quantized/qmm.hip
+index 478c92c4..8a0f83a1 100644
+--- a/mlx/backend/rocm/quantized/qmm.hip
++++ b/mlx/backend/rocm/quantized/qmm.hip
+@@ -511,6 +511,12 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
+   if (N < 256) {
+     return 4;
+   }
++  // Strix Halo/gfx1151 Qwen3/Qwen3.5 4-bit decode benefits from the same
++  // stable warp/shared 64-column shape that forced MLX_ROCM_QMV_COLS_PER_BLOCK
++  // uses for the dominant N>=1024 projections, without enabling tiled QMV.
++  if (bits == 4 && N >= 1024) {
++    return 64;
++  }
+   if (K <= 1024) {
+     return (N < 1024) ? 8 : 16;
+   }

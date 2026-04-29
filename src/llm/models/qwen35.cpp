@@ -11,6 +11,7 @@
 #include <mlx-lm/common/quantized_linear.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace mx = mlx::core;
 
@@ -90,6 +91,19 @@ void from_json(const nlohmann::json& j, Qwen35Configuration& c) {
 static mx::array linear_fwd(const mx::array& x, const mx::array& w,
                               const std::optional<mx::array>& bias = std::nullopt) {
     return linear_forward(x, w, bias.has_value() ? &bias.value() : nullptr);
+}
+
+static bool project_only_last_token_for_generation() {
+    const char* raw = std::getenv("LEMON_MLX_FULL_PREFILL_LOGITS");
+    return !(raw && raw[0] == '1' && raw[1] == '\0');
+}
+
+static mx::array last_token_hidden_for_generation(const mx::array& x) {
+    if (!project_only_last_token_for_generation() || x.ndim() != 3 || x.shape(1) <= 1) {
+        return x;
+    }
+    int seq_len = x.shape(1);
+    return mx::slice(x, {0, seq_len - 1, 0}, {x.shape(0), seq_len, x.shape(2)});
 }
 
 // --- Qwen35RMSNormGated ---
@@ -221,7 +235,9 @@ mx::array Qwen35GatedDeltaNet::operator()(
                 // beta + g fused
                 auto beta = mx::sigmoid(b);
                 auto a_log_f32 = mx::astype(a_log, mx::float32);
-                auto sp = mx::log(mx::add(mx::exp(mx::add(a, dt_bias)), mx::array(1.0f)));
+                auto a_f32 = mx::astype(a, mx::float32);
+                auto dt_bias_f32 = mx::astype(dt_bias, mx::float32);
+                auto sp = mx::log(mx::add(mx::exp(mx::add(a_f32, dt_bias_f32)), mx::array(1.0f)));
                 auto g = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), sp)));
                 g = mx::astype(g, a.dtype());
 
@@ -575,7 +591,7 @@ Qwen35ModelInner::Qwen35ModelInner(const Qwen35Configuration& args)
 }
 
 mx::array Qwen35ModelInner::operator()(const mx::array& inputs, std::vector<KVCache>* cache) {
-    auto h = mx::take(embed_tokens_weight_, inputs, 0);
+    auto h = embedding_forward(embed_tokens_weight_, inputs);
 
     // Find the first full-attention index for attention mask
     // Swift: faIdx = fullAttentionInterval - 1
@@ -598,7 +614,7 @@ mx::array Qwen35ModelInner::operator()(const mx::array& inputs, std::vector<KVCa
 }
 
 mx::array Qwen35ModelInner::embed_as_linear(const mx::array& x) const {
-    return mx::matmul(x, mx::transpose(embed_tokens_weight_));
+    return linear_fwd(x, embed_tokens_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35ModelInner::weight_map() {
@@ -633,6 +649,7 @@ LMOutput Qwen35Model::call_impl(const LMInput::Text& input, std::vector<KVCache>
 
 mx::array Qwen35Model::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
     auto out = model_(inputs, cache);
+    out = last_token_hidden_for_generation(out);
     if (lm_head_weight_.has_value()) return linear_fwd(out, lm_head_weight_.value());
     return model_.embed_as_linear(out);
 }
@@ -655,11 +672,20 @@ Qwen35Model::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
     // Swift: hasMTPWeights / hasUnsanitizedConv1d -> shouldShiftNormWeights
     bool has_mtp_weights = false;
     bool has_unsanitized_conv1d = false;
+    bool has_quantized_scales = false;
+    for (const auto& [key, value] : weights) {
+        (void)value;
+        if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".scales") == 0) {
+            has_quantized_scales = true;
+        }
+    }
     for (const auto& [key, value] : weights) {
         if (key.find("mtp.") != std::string::npos) {
             has_mtp_weights = true;
         }
-        if (key.find("conv1d.weight") != std::string::npos && value.shape(-1) != 1) {
+        if (!has_quantized_scales &&
+            key.find("conv1d.weight") != std::string::npos &&
+            value.shape(-1) != 1) {
             has_unsanitized_conv1d = true;
         }
     }
@@ -726,11 +752,8 @@ Qwen35Model::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
         }
     }
 
-    // Fix conv1d weight ordering.
-    // Note: Swift sanitize conditionally adds +1 to norm weights when
-    // shouldShiftNormWeights is true (MTP/raw weights). We do NOT add +1
-    // here because our rms_norm uses weight directly (not 1+weight),
-    // and MLX-community quantized models already store direct multipliers (~1.0).
+    // Fix conv1d weight ordering and apply HF Qwen3.5 RMSNorm scale shift.
+    // GatedDeltaNet's linear_attn.norm.weight is already a direct scale.
     std::vector<std::string> norm_suffixes = {
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",
@@ -746,18 +769,19 @@ Qwen35Model::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
             value = mx::moveaxis(value, 2, 1);
             continue;
         }
-        bool is_norm = false;
+        bool is_standard_norm = false;
         for (const auto& suffix : norm_suffixes) {
             if (key.size() >= suffix.size() &&
                 key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                is_norm = true;
+                is_standard_norm = true;
                 break;
             }
         }
-        // Do not add +1: our rms_norm uses weight directly (not 1+weight).
-        // The mlx-community quantized safetensors stores weights as direct multipliers (~1.0).
-        (void)is_norm;
-        (void)should_shift_norm_weights;
+        if (should_shift_norm_weights &&
+            is_standard_norm &&
+            key.find("linear_attn.norm.weight") == std::string::npos) {
+            value = mx::add(value, mx::array(1.0f));
+        }
     }
 
     return weights;

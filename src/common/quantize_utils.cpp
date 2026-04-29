@@ -9,6 +9,34 @@ namespace mx = mlx::core;
 
 namespace mlx_lm {
 
+static std::optional<Quantization> quantization_for_prefix(
+    const PerLayerQuantization& plq,
+    const std::string& prefix)
+{
+    auto lookup_override = [&](const std::string& key) -> std::optional<Quantization> {
+        auto it = plq.per_layer.find(key);
+        if (it == plq.per_layer.end()) return std::nullopt;
+        if (it->second.tag == QuantizationOptionTag::Skip) return std::nullopt;
+        return it->second.quantization;
+    };
+
+    auto quant = lookup_override(prefix);
+    if (quant.has_value()) return quant;
+
+    // Some VLM/text models sanitize "language_model.model.*" weights to
+    // "model.*" before quantized weight registration. Their config.json
+    // keeps the original unsanitized quantization keys.
+    if (prefix.find("model.") == 0) {
+        quant = lookup_override("language_model." + prefix);
+        if (quant.has_value()) return quant;
+
+        quant = lookup_override("model.language_model." + prefix.substr(6));
+        if (quant.has_value()) return quant;
+    }
+
+    return plq.default_quantization;
+}
+
 void register_quantized_weights(
     std::unordered_map<std::string, mx::array>& weights,
     const BaseConfiguration& config,
@@ -45,7 +73,7 @@ void register_quantized_weights(
         // Check per-layer quantization overrides
         int group_size = default_group_size;
         int bits = default_bits;
-        auto layer_quant = plq.quantization_for(prefix);
+        auto layer_quant = quantization_for_prefix(plq, prefix);
         if (layer_quant.has_value()) {
             group_size = layer_quant->group_size;
             bits = layer_quant->bits;
@@ -59,14 +87,32 @@ void register_quantized_weights(
             biases = biases_it->second;
         }
 
-        // Embedding weights use mx::take() for lookup, not matmul.
-        // They must be dequantized at load time (quantized_matmul won't help).
+        // Qwen3/Qwen3.5 have been updated to call embedding_forward(), so they can keep
+        // embeddings packed and dequantize only selected token rows. Other
+        // model ports still call mx::take() directly on the embedding array,
+        // so they need the legacy dequantized embedding tensor.
         bool is_embedding = (prefix.find("embed") != std::string::npos);
 
         if (is_embedding) {
-            // Dequantize in-place so load_weights() gets the float weight
-            auto& packed = weights.at(weight_key);
-            packed = mx::dequantize(packed, scales, biases, group_size, bits);
+            if (config.model_type != "qwen3" && config.model_type != "qwen3_5") {
+                auto& weight = weights.at(weight_key);
+                if (biases.has_value()) {
+                    weight = mx::dequantize(weight, scales, biases.value(), group_size, bits);
+                } else {
+                    weight = mx::dequantize(weight, scales, std::nullopt, group_size, bits);
+                }
+                weights.erase(scales_key);
+                if (biases_it != weights.end()) {
+                    weights.erase(biases_it);
+                }
+                continue;
+            }
+            auto wm_it = weight_map.find(weight_key);
+            if (wm_it == weight_map.end()) {
+                continue;
+            }
+            mx::array* member_ptr = wm_it->second;
+            reg.register_weight(member_ptr, scales, biases, group_size, bits, weight_key);
         } else {
             // Find the model's member array address for this weight
             auto wm_it = weight_map.find(weight_key);
@@ -75,7 +121,7 @@ void register_quantized_weights(
                 continue;
             }
             mx::array* member_ptr = wm_it->second;
-            reg.register_weight(member_ptr, scales, biases, group_size, bits);
+            reg.register_weight(member_ptr, scales, biases, group_size, bits, weight_key);
         }
 
         // Remove scales/biases from the weight map so they don't get
@@ -122,7 +168,7 @@ std::unordered_map<std::string, mx::array> dequantize_weights(
 
         int group_size = default_group_size;
         int bits = default_bits;
-        auto layer_quant = plq.quantization_for(prefix);
+        auto layer_quant = quantization_for_prefix(plq, prefix);
         if (layer_quant.has_value()) {
             group_size = layer_quant->group_size;
             bits = layer_quant->bits;

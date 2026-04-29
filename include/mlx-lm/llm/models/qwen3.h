@@ -38,7 +38,7 @@ class Qwen3Attention {
     int head_dim_;
     float scale_;
 
-    mlx::core::array wq_weight_, wk_weight_, wv_weight_, wo_weight_;
+    mlx::core::array wqkv_weight_, wo_weight_;
     mlx::core::array q_norm_weight_, k_norm_weight_;
     float rms_norm_eps_;
 
@@ -54,7 +54,7 @@ public:
 };
 
 class Qwen3MLP {
-    mlx::core::array gate_weight_, down_weight_, up_weight_;
+    mlx::core::array gate_up_weight_, down_weight_;
 
 public:
     Qwen3MLP(int dimensions, int hidden_dimensions);

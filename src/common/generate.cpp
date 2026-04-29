@@ -461,8 +461,17 @@ std::optional<int> TokenIterator::next() {
 
     // The current y_ holds the previously computed token.
     auto previous_y = y_;
+    mx::eval(previous_y.tokens);
+    int previous_token = previous_y.tokens.item<int32_t>();
 
-    // Compute the next token (evaluates the model for the *next* step).
+    if (max_tokens_.has_value() && token_count_ + 1 >= max_tokens_.value()) {
+        token_count_++;
+        return previous_token;
+    }
+
+    // Compute the next token from an evaluated input token. Native quantized
+    // ROCm kernels can otherwise observe intermittent bad decode state when
+    // the sampled token is only asynchronously materialized.
     auto token = step(previous_y);
     y_ = LMInput::Text(token);
 
@@ -472,8 +481,7 @@ std::optional<int> TokenIterator::next() {
     token_count_++;
 
     // Return the *previous* token (which was already computed and ready).
-    mx::eval(previous_y.tokens);
-    return previous_y.tokens.item<int32_t>();
+    return previous_token;
 }
 
 // ---------------------------------------------------------------------------

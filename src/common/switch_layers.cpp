@@ -63,29 +63,34 @@ mx::array SwitchLinear::operator()(
     bool sorted_indices)
 {
     auto* qi = QuantizedWeightRegistry::instance().find(&weight_);
+    auto& registry = QuantizedWeightRegistry::instance();
+    const std::string name = qi ? qi->name : std::string();
+    registry.record_linear(qi != nullptr, name, x, weight_);
 
-    mx::array result(0.0f);
-    if (qi) {
-        result = mx::gather_qmm(
-            x, weight_, qi->scales, qi->biases,
-            /*lhs_indices=*/std::nullopt,
-            /*rhs_indices=*/std::optional<mx::array>(indices),
-            /*transpose=*/true,
-            /*group_size=*/qi->group_size,
-            /*bits=*/qi->bits,
-            /*mode=*/"affine",
-            /*sorted_indices=*/sorted_indices);
-    } else {
-        auto weight_t = mx::swapaxes(weight_, -1, -2);
-        result = mx::gather_mm(x, weight_t, std::nullopt, indices, sorted_indices);
-    }
+    return registry.profile_array_eval(qi != nullptr, false, name, x, weight_, [&]() {
+        mx::array result(0.0f);
+        if (qi) {
+            result = mx::gather_qmm(
+                x, weight_, qi->scales, qi->biases,
+                /*lhs_indices=*/std::nullopt,
+                /*rhs_indices=*/std::optional<mx::array>(indices),
+                /*transpose=*/true,
+                /*group_size=*/qi->group_size,
+                /*bits=*/qi->bits,
+                /*mode=*/"affine",
+                /*sorted_indices=*/sorted_indices);
+        } else {
+            auto weight_t = mx::swapaxes(weight_, -1, -2);
+            result = mx::gather_mm(x, weight_t, std::nullopt, indices, sorted_indices);
+        }
 
-    if (bias_.has_value()) {
-        auto b = mx::take(bias_.value(), indices, 0);
-        result = mx::add(result, mx::expand_dims(b, -2));
-    }
+        if (bias_.has_value()) {
+            auto b = mx::take(bias_.value(), indices, 0);
+            result = mx::add(result, mx::expand_dims(b, -2));
+        }
 
-    return result;
+        return result;
+    });
 }
 
 std::unordered_map<std::string, mx::array*> SwitchLinear::weight_map() {

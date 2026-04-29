@@ -2,8 +2,9 @@
 // Port of Qwen35.swift + Qwen35MoE.swift -- Hybrid GatedDeltaNet + Attention + MoE
 //
 // Qwen3.5 differs from Qwen3Next in several ways:
-// - GDN uses 4 separate projections (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)
-//   instead of 2 combined ones (in_proj_qkvz, in_proj_ba)
+// - Checkpoints store separate GDN qkv/z/b/a and dense SwiGLU gate/up
+//   projections; sanitize fuses those regular linear groups for fewer decode
+//   launches.
 // - All layers use MoE (when num_experts > 0), not alternating with dense MLP
 // - MoE sanitize splits fused gate_up_proj into gate_proj + up_proj
 
@@ -12,11 +13,28 @@
 #include <mlx-lm/common/activations.h>
 #include <mlx-lm/common/quantized_linear.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
+#include <iostream>
 
 namespace mx = mlx::core;
 
 namespace mlx_lm {
+
+static bool qwen35_env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+static int qwen35_env_int(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    return end != value ? static_cast<int>(parsed) : fallback;
+}
 
 // --- Configuration ---
 
@@ -105,6 +123,30 @@ static mx::array linear_fwd(const mx::array& x, const mx::array& w,
     return linear_forward(x, w, bias.has_value() ? &bias.value() : nullptr);
 }
 
+static bool project_only_last_token_for_generation() {
+    const char* raw = std::getenv("LEMON_MLX_FULL_PREFILL_LOGITS");
+    return !(raw && raw[0] == '1' && raw[1] == '\0');
+}
+
+static bool qwen35_decode_fastpath_enabled() {
+    if (qwen35_env_enabled("LEMON_MLX_QWEN35_DISABLE_DECODE_FASTPATH")) {
+        return false;
+    }
+    const char* raw = std::getenv("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
+    if (raw) {
+        return qwen35_env_enabled("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
+    }
+    return true;
+}
+
+static mx::array last_token_hidden_for_generation(const mx::array& x) {
+    if (!project_only_last_token_for_generation() || x.ndim() != 3 || x.shape(1) <= 1) {
+        return x;
+    }
+    int seq_len = x.shape(1);
+    return mx::slice(x, {0, seq_len - 1, 0}, {x.shape(0), seq_len, x.shape(2)});
+}
+
 // --- Qwen35MoEAttention ---
 // Swift: Qwen35Attention -- standard attention with sigmoid gate on q_proj output
 
@@ -114,9 +156,10 @@ Qwen35MoEAttention::Qwen35MoEAttention(const Qwen35MoEConfiguration& args)
       head_dim_(args.resolved_head_dim()),
       scale_(std::pow(static_cast<float>(args.resolved_head_dim()), -0.5f)),
       // q_proj outputs 2x head_dim for the sigmoid gate
-      q_proj_weight_(mx::zeros({args.num_attention_heads * args.resolved_head_dim() * 2, args.hidden_size})),
-      k_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
-      v_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
+      qkv_proj_weight_(mx::zeros({
+          args.num_attention_heads * args.resolved_head_dim() * 2 +
+              2 * args.num_key_value_heads * args.resolved_head_dim(),
+          args.hidden_size})),
       o_proj_weight_(mx::zeros({args.hidden_size, args.num_attention_heads * args.resolved_head_dim()})),
       q_norm_weight_(mx::ones({args.resolved_head_dim()})),
       k_norm_weight_(mx::ones({args.resolved_head_dim()})),
@@ -125,9 +168,9 @@ Qwen35MoEAttention::Qwen35MoEAttention(const Qwen35MoEConfiguration& args)
       rope_dims_(std::max(1, static_cast<int>(args.resolved_head_dim() * args.partial_rotary_factor)))
 {
     if (args.attention_bias) {
-        q_proj_bias_ = mx::zeros({args.num_attention_heads * args.resolved_head_dim() * 2});
-        k_proj_bias_ = mx::zeros({args.num_key_value_heads * args.resolved_head_dim()});
-        v_proj_bias_ = mx::zeros({args.num_key_value_heads * args.resolved_head_dim()});
+        qkv_proj_bias_ = mx::zeros({
+            args.num_attention_heads * args.resolved_head_dim() * 2 +
+                2 * args.num_key_value_heads * args.resolved_head_dim()});
         o_proj_bias_ = mx::zeros({args.hidden_size});
     }
 }
@@ -137,7 +180,10 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
                                            KVCache* cache) {
     int B = x.shape(0), L = x.shape(1);
 
-    auto q_proj_out = linear_fwd(x, q_proj_weight_, q_proj_bias_);
+    auto qkv = linear_fwd(x, qkv_proj_weight_, qkv_proj_bias_);
+    int q_gate_dim = num_heads_ * head_dim_ * 2;
+    int kv_dim = num_kv_heads_ * head_dim_;
+    auto q_proj_out = mx::slice(qkv, {0, 0, 0}, {B, L, q_gate_dim});
     // Reshape to [B, L, num_heads, 2*head_dim] then split into queries + gate
     q_proj_out = mx::reshape(q_proj_out, {B, L, num_heads_, -1});
     int hd = head_dim_;
@@ -145,8 +191,8 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
     auto gate = mx::slice(q_proj_out, {0, 0, 0, hd}, {B, L, num_heads_, 2 * hd});
     gate = mx::reshape(gate, {B, L, -1});
 
-    auto keys = linear_fwd(x, k_proj_weight_, k_proj_bias_);
-    auto values = linear_fwd(x, v_proj_weight_, v_proj_bias_);
+    auto keys = mx::slice(qkv, {0, 0, q_gate_dim}, {B, L, q_gate_dim + kv_dim});
+    auto values = mx::slice(qkv, {0, 0, q_gate_dim + kv_dim}, {B, L, q_gate_dim + 2 * kv_dim});
 
     // RMSNorm on queries and keys with learned weights
     queries = mx::transpose(
@@ -185,17 +231,13 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEAttention::weight_map() {
     std::unordered_map<std::string, mx::array*> map = {
-        {"q_proj.weight", &q_proj_weight_},
-        {"k_proj.weight", &k_proj_weight_},
-        {"v_proj.weight", &v_proj_weight_},
+        {"qkv_proj.weight", &qkv_proj_weight_},
         {"o_proj.weight", &o_proj_weight_},
         {"q_norm.weight", &q_norm_weight_},
         {"k_norm.weight", &k_norm_weight_},
     };
-    if (q_proj_bias_.has_value()) {
-        map["q_proj.bias"] = &q_proj_bias_.value();
-        map["k_proj.bias"] = &k_proj_bias_.value();
-        map["v_proj.bias"] = &v_proj_bias_.value();
+    if (qkv_proj_bias_.has_value()) {
+        map["qkv_proj.bias"] = &qkv_proj_bias_.value();
         map["o_proj.bias"] = &o_proj_bias_.value();
     }
     return map;
@@ -216,10 +258,9 @@ Qwen35MoEGatedDeltaNet::Qwen35MoEGatedDeltaNet(const Qwen35MoEConfiguration& arg
       conv_dim_(args.linear_key_head_dim * args.linear_num_key_heads * 2
                 + args.linear_value_head_dim * args.linear_num_value_heads),
       conv1d_weight_(mx::zeros({conv_dim_, 1, args.linear_conv_kernel_dim})),
-      in_proj_qkv_weight_(mx::zeros({key_dim_ * 2 + value_dim_, args.hidden_size})),
-      in_proj_z_weight_(mx::zeros({value_dim_, args.hidden_size})),
-      in_proj_b_weight_(mx::zeros({args.linear_num_value_heads, args.hidden_size})),
-      in_proj_a_weight_(mx::zeros({args.linear_num_value_heads, args.hidden_size})),
+      in_proj_qkv_z_ba_weight_(mx::zeros({
+          key_dim_ * 2 + value_dim_ + value_dim_ + args.linear_num_value_heads * 2,
+          args.hidden_size})),
       dt_bias_(mx::ones({args.linear_num_value_heads})),
       a_log_(mx::zeros({args.linear_num_value_heads})),
       norm_(args.linear_value_head_dim, args.rms_norm_eps),
@@ -231,13 +272,34 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     const std::optional<mx::array>& mask,
     MambaCache* cache)
 {
+    auto debug_eval = [](const char* label, const mx::array& value) {
+        if (!qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_GDN")) {
+            return;
+        }
+        std::cerr << "[qwen35-debug] eval gdn " << label << " begin" << std::endl;
+        mx::eval(value);
+        std::cerr << "[qwen35-debug] eval gdn " << label << " done" << std::endl;
+    };
+
     int B = inputs.shape(0), S = inputs.shape(1);
 
-    // 4 separate projections (unlike Qwen3Next which uses 2 combined)
-    auto qkv = linear_fwd(inputs, in_proj_qkv_weight_);
-    auto z = mx::reshape(linear_fwd(inputs, in_proj_z_weight_), {B, S, num_v_heads_, head_v_dim_});
-    auto b_val = linear_fwd(inputs, in_proj_b_weight_);
-    auto a_val = linear_fwd(inputs, in_proj_a_weight_);
+    // Checkpoints provide qkv/z/b/a weights; sanitize packs them into one
+    // projection to reduce decode launches.
+    auto qkv_z_ba = linear_fwd(inputs, in_proj_qkv_z_ba_weight_);
+    int qkv_dim = key_dim_ * 2 + value_dim_;
+    int z_offset = qkv_dim;
+    int ba_offset = z_offset + value_dim_;
+    auto qkv = mx::slice(qkv_z_ba, {0, 0, 0}, {B, S, qkv_dim});
+    debug_eval("qkv", qkv);
+    auto z = mx::reshape(
+        mx::slice(qkv_z_ba, {0, 0, z_offset}, {B, S, ba_offset}),
+        {B, S, num_v_heads_, head_v_dim_});
+    debug_eval("z", z);
+    auto ba_val = mx::slice(qkv_z_ba, {0, 0, ba_offset}, {B, S, ba_offset + num_v_heads_ * 2});
+    auto b_val = mx::slice(ba_val, {0, 0, 0}, {B, S, num_v_heads_});
+    debug_eval("b", b_val);
+    auto a_val = mx::slice(ba_val, {0, 0, num_v_heads_}, {B, S, num_v_heads_ * 2});
+    debug_eval("a", a_val);
 
     // Conv1d processing
     auto dtype = inputs.dtype();
@@ -260,8 +322,11 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         (*cache)[0] = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
     }
 
-    // T=1 decode fast path
-    if (S == 1 && cache && (*cache)[0].has_value() && conv_input.shape(1) == conv_kernel_size_) {
+    // T=1 decode fast path. It matches the reference path on the Qwen3.5
+    // BF16/dequant/native smoke and quant-forward parity gates; keep env
+    // controls for targeted bisects.
+    if (qwen35_decode_fastpath_enabled() &&
+        S == 1 && cache && (*cache)[0].has_value() && conv_input.shape(1) == conv_kernel_size_) {
         // Fused conv1d + silu
         auto w = mx::reshape(
             mx::transpose(mx::reshape(conv1d_weight_, {conv_dim_, conv_kernel_size_})),
@@ -273,6 +338,7 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
             },
             /*shapeless=*/true);
         auto conv_out = compiled_conv_silu({conv_input, w})[0];
+        debug_eval("conv_decode", conv_out);
 
         // Split into q, k, v
         auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, 1, key_dim_}),
@@ -288,6 +354,8 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         auto k_norm_w = mx::full({head_k_dim_}, inv_scale, dtype);
         q_out = mx::fast::rms_norm(q_out, q_norm_w, 1e-6f);
         k_out = mx::fast::rms_norm(k_out, k_norm_w, 1e-6f);
+        debug_eval("q_norm", q_out);
+        debug_eval("k_norm", k_out);
 
         // Fused GDN decode step
         auto ssm_state = (*cache)[1].has_value() ? (*cache)[1].value()
@@ -307,7 +375,9 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
                 // beta + g fused
                 auto beta = mx::sigmoid(b);
                 auto a_log_f32 = mx::astype(a_log, mx::float32);
-                auto sp = mx::log(mx::add(mx::exp(mx::add(a, dt_bias)), mx::array(1.0f)));
+                auto a_f32 = mx::astype(a, mx::float32);
+                auto dt_bias_f32 = mx::astype(dt_bias, mx::float32);
+                auto sp = mx::log(mx::add(mx::exp(mx::add(a_f32, dt_bias_f32)), mx::array(1.0f)));
                 auto g = mx::exp(mx::negative(mx::multiply(mx::exp(a_log_f32), sp)));
                 g = mx::astype(g, a.dtype());
 
@@ -342,15 +412,21 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
             {q_out, k_out, v_out, b_val, a_log_, a_val, dt_bias_, ssm_state});
         auto out = results[0];
         (*cache)[1] = results[1];
+        debug_eval("decode_out", out);
+        debug_eval("decode_state", (*cache)[1].value());
 
         // Gated norm + output projection
         auto normalized = norm_(out, z);
-        return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+        debug_eval("norm", normalized);
+        auto projected = linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+        debug_eval("out_proj", projected);
+        return projected;
     }
 
     // General path: T>1 prefill
     auto conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
     conv_out = silu(conv_out);
+    debug_eval("conv_prefill", conv_out);
 
     auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, S, key_dim_}),
                               {B, S, num_k_heads_, head_k_dim_});
@@ -364,6 +440,8 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     auto k_norm_w = mx::full({head_k_dim_}, inv_scale, k_out.dtype());
     q_out = mx::fast::rms_norm(q_out, q_norm_w, 1e-6f);
     k_out = mx::fast::rms_norm(k_out, k_norm_w, 1e-6f);
+    debug_eval("prefill_q_norm", q_out);
+    debug_eval("prefill_k_norm", k_out);
 
     std::optional<mx::array> ssm_state;
     if (cache && (*cache)[1].has_value()) {
@@ -372,22 +450,24 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
 
     auto [out, new_state] = gated_delta_update(
         q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state, mask);
+    debug_eval("prefill_out", out);
+    debug_eval("prefill_state", new_state);
 
     if (cache) {
         (*cache)[1] = new_state;
     }
 
     auto normalized = norm_(out, z);
-    return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+    debug_eval("prefill_norm", normalized);
+    auto projected = linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+    debug_eval("prefill_out_proj", projected);
+    return projected;
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEGatedDeltaNet::weight_map() {
     std::unordered_map<std::string, mx::array*> map;
     map["conv1d.weight"] = &conv1d_weight_;
-    map["in_proj_qkv.weight"] = &in_proj_qkv_weight_;
-    map["in_proj_z.weight"] = &in_proj_z_weight_;
-    map["in_proj_b.weight"] = &in_proj_b_weight_;
-    map["in_proj_a.weight"] = &in_proj_a_weight_;
+    map["in_proj_qkv_z_ba.weight"] = &in_proj_qkv_z_ba_weight_;
     map["dt_bias"] = &dt_bias_;
     map["A_log"] = &a_log_;
     for (auto& [k, v] : norm_.weight_map()) map["norm." + k] = v;
@@ -399,21 +479,20 @@ std::unordered_map<std::string, mx::array*> Qwen35MoEGatedDeltaNet::weight_map()
 // Swift: Qwen3NextMLP reused -- dense MLP with SwiGLU
 
 Qwen35MoEMLP::Qwen35MoEMLP(int dimensions, int hidden_dimensions)
-    : gate_proj_weight_(mx::zeros({hidden_dimensions, dimensions})),
-      down_proj_weight_(mx::zeros({dimensions, hidden_dimensions})),
-      up_proj_weight_(mx::zeros({hidden_dimensions, dimensions}))
+    : gate_up_proj_weight_(mx::zeros({2 * hidden_dimensions, dimensions})),
+      down_proj_weight_(mx::zeros({dimensions, hidden_dimensions}))
 {}
 
 mx::array Qwen35MoEMLP::operator()(const mx::array& x) {
-    auto g = linear_fwd(x, gate_proj_weight_);
-    return linear_fwd(swiglu(g, linear_fwd(x, up_proj_weight_)), down_proj_weight_);
+    auto gate_up = linear_fwd(x, gate_up_proj_weight_);
+    auto parts = mx::split(gate_up, 2, -1);
+    return linear_fwd(swiglu(parts[0], parts[1]), down_proj_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEMLP::weight_map() {
     return {
-        {"gate_proj.weight", &gate_proj_weight_},
+        {"gate_up_proj.weight", &gate_up_proj_weight_},
         {"down_proj.weight", &down_proj_weight_},
-        {"up_proj.weight", &up_proj_weight_},
     };
 }
 
@@ -562,7 +641,14 @@ Qwen35MoEModelInner::Qwen35MoEModelInner(const Qwen35MoEConfiguration& args)
 }
 
 mx::array Qwen35MoEModelInner::operator()(const mx::array& inputs, std::vector<KVCache>* cache) {
-    auto h = mx::take(embed_tokens_weight_, inputs, 0);
+    const bool eval_layers = qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_LAYERS");
+    const int max_layers = qwen35_env_int("LEMON_MLX_QWEN35_MAX_LAYERS", -1);
+    auto h = embedding_forward(embed_tokens_weight_, inputs);
+    if (eval_layers) {
+        std::cerr << "[qwen35-debug] eval embed begin" << std::endl;
+        mx::eval(h);
+        std::cerr << "[qwen35-debug] eval embed done" << std::endl;
+    }
 
     // Find the first full-attention index for attention mask
     int fa_idx = full_attention_interval_ - 1;
@@ -575,16 +661,25 @@ mx::array Qwen35MoEModelInner::operator()(const mx::array& inputs, std::vector<K
     std::optional<mx::array> ssm_mask;
 
     for (size_t i = 0; i < layers_.size(); ++i) {
+        if (max_layers >= 0 && static_cast<int>(i) >= max_layers) {
+            break;
+        }
         KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
         auto attn_mask = layers_[i].is_linear() ? AttentionMask{} : fa_mask;
         h = layers_[i](h, attn_mask, ssm_mask, lc);
+        if (eval_layers) {
+            std::cerr << "[qwen35-debug] eval layer " << i << " begin"
+                      << (layers_[i].is_linear() ? " linear" : " attention") << std::endl;
+            mx::eval(h);
+            std::cerr << "[qwen35-debug] eval layer " << i << " done" << std::endl;
+        }
     }
 
     return mx::fast::rms_norm(h, norm_weight_, rms_norm_eps_);
 }
 
 mx::array Qwen35MoEModelInner::embed_as_linear(const mx::array& x) const {
-    return mx::matmul(x, mx::transpose(embed_tokens_weight_));
+    return linear_fwd(x, embed_tokens_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEModelInner::weight_map() {
@@ -619,6 +714,15 @@ LMOutput Qwen35MoEModel::call_impl(const LMInput::Text& input, std::vector<KVCac
 
 mx::array Qwen35MoEModel::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
     auto out = model_(inputs, cache);
+    out = last_token_hidden_for_generation(out);
+    if (qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_BODY")) {
+        std::cerr << "[qwen35-debug] eval body begin" << std::endl;
+        mx::eval(out);
+        std::cerr << "[qwen35-debug] eval body done" << std::endl;
+    }
+    if (qwen35_env_enabled("LEMON_MLX_QWEN35_ZERO_LOGITS")) {
+        return mx::zeros({out.shape(0), out.shape(1), config_.vocab_size}, out.dtype());
+    }
     if (lm_head_weight_.has_value()) return linear_fwd(out, lm_head_weight_.value());
     return model_.embed_as_linear(out);
 }
@@ -638,6 +742,33 @@ std::vector<KVCache> Qwen35MoEModel::new_cache_impl(const GenerateParameters& pa
 
 std::unordered_map<std::string, mx::array>
 Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
+    bool should_shift_norm_weights = false;
+    bool has_quantized_scales = false;
+    for (const auto& [key, value] : weights) {
+        (void)value;
+        if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".scales") == 0) {
+            has_quantized_scales = true;
+        }
+    }
+    for (const auto& [key, value] : weights) {
+        if (key.find("mtp.") != std::string::npos) {
+            should_shift_norm_weights = true;
+            break;
+        }
+        if (!has_quantized_scales &&
+            key.find("conv1d.weight") != std::string::npos &&
+            value.shape(-1) != 1) {
+            should_shift_norm_weights = true;
+            break;
+        }
+    }
+    if (qwen35_env_enabled("LEMON_MLX_QWEN35_FORCE_NORM_SHIFT")) {
+        should_shift_norm_weights = true;
+    }
+    if (qwen35_env_enabled("LEMON_MLX_QWEN35_DISABLE_NORM_SHIFT")) {
+        should_shift_norm_weights = false;
+    }
+
     if (config_.tie_word_embeddings) weights.erase("lm_head.weight");
 
     // Remove mtp.* keys
@@ -660,15 +791,172 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
         }
 
         std::string new_key = key;
-        // Strip "language_model." prefix from VLM wrapper:
+        // Strip VLM wrapper prefixes from text weights:
+        //   "model.language_model.layers.X" -> "model.layers.X"
         //   "language_model.model.X" -> "model.X"
         //   "language_model.lm_head.X" -> "lm_head.X"
-        if (new_key.find("language_model.") == 0) {
+        if (new_key.find("model.language_model.") == 0) {
+            new_key = "model." + new_key.substr(std::string("model.language_model.").size());
+        } else if (new_key.find("language_model.") == 0) {
             new_key = new_key.substr(std::string("language_model.").size());
         }
         remapped.insert_or_assign(new_key, std::move(value));
     }
     weights = std::move(remapped);
+
+    // Fuse full-attention q/k/v projections into one quantized matmul.
+    // Qwen3.5's q_proj includes the sigmoid gate half, so preserve q,k,v
+    // order and slice the q+gate block back apart in the attention path.
+    for (int l = 0; l < config_.num_hidden_layers; ++l) {
+        std::string attn_prefix = "model.layers." + std::to_string(l) + ".self_attn.";
+        std::string q_prefix = attn_prefix + "q_proj";
+        std::string k_prefix = attn_prefix + "k_proj";
+        std::string v_prefix = attn_prefix + "v_proj";
+        std::string qkv_prefix = attn_prefix + "qkv_proj";
+
+        auto q_weight = weights.find(q_prefix + ".weight");
+        auto k_weight = weights.find(k_prefix + ".weight");
+        auto v_weight = weights.find(v_prefix + ".weight");
+        if (q_weight == weights.end() || k_weight == weights.end() || v_weight == weights.end()) {
+            continue;
+        }
+
+        std::vector<mx::array> joined;
+        joined.push_back(std::move(q_weight->second));
+        joined.push_back(std::move(k_weight->second));
+        joined.push_back(std::move(v_weight->second));
+        weights.erase(q_weight);
+        weights.erase(k_weight);
+        weights.erase(v_weight);
+        weights.insert_or_assign(qkv_prefix + ".weight", mx::concatenate(joined, 0));
+
+        auto fuse_optional = [&](const std::string& suffix) {
+            auto q_part = weights.find(q_prefix + suffix);
+            auto k_part = weights.find(k_prefix + suffix);
+            auto v_part = weights.find(v_prefix + suffix);
+            if (q_part == weights.end() || k_part == weights.end() || v_part == weights.end()) {
+                return;
+            }
+            joined.clear();
+            joined.push_back(std::move(q_part->second));
+            joined.push_back(std::move(k_part->second));
+            joined.push_back(std::move(v_part->second));
+            weights.erase(q_part);
+            weights.erase(k_part);
+            weights.erase(v_part);
+            weights.insert_or_assign(qkv_prefix + suffix, mx::concatenate(joined, 0));
+        };
+
+        fuse_optional(".scales");
+        fuse_optional(".biases");
+        fuse_optional(".bias");
+    }
+
+    // Fuse the GDN input projections into one quantized matmul. The Swift
+    // model keeps them separate, but for decode this saves two launches per
+    // linear-attention layer without changing the math.
+    for (int l = 0; l < config_.num_hidden_layers; ++l) {
+        std::string prefix = "model.layers." + std::to_string(l) + ".linear_attn.";
+        std::string qkv_prefix = prefix + "in_proj_qkv";
+        std::string z_prefix = prefix + "in_proj_z";
+        std::string b_prefix = prefix + "in_proj_b";
+        std::string a_prefix = prefix + "in_proj_a";
+        std::string fused_prefix = prefix + "in_proj_qkv_z_ba";
+
+        auto qkv_weight = weights.find(qkv_prefix + ".weight");
+        auto z_weight = weights.find(z_prefix + ".weight");
+        auto b_weight = weights.find(b_prefix + ".weight");
+        auto a_weight = weights.find(a_prefix + ".weight");
+        if (qkv_weight == weights.end() || z_weight == weights.end() ||
+            b_weight == weights.end() || a_weight == weights.end()) {
+            continue;
+        }
+
+        std::vector<mx::array> joined;
+        joined.push_back(std::move(qkv_weight->second));
+        joined.push_back(std::move(z_weight->second));
+        joined.push_back(std::move(b_weight->second));
+        joined.push_back(std::move(a_weight->second));
+        weights.erase(qkv_weight);
+        weights.erase(z_weight);
+        weights.erase(b_weight);
+        weights.erase(a_weight);
+        weights.insert_or_assign(fused_prefix + ".weight", mx::concatenate(joined, 0));
+
+        auto fuse_optional = [&](const std::string& suffix) {
+            auto qkv_part = weights.find(qkv_prefix + suffix);
+            auto z_part = weights.find(z_prefix + suffix);
+            auto b_part = weights.find(b_prefix + suffix);
+            auto a_part = weights.find(a_prefix + suffix);
+            if (qkv_part == weights.end() || z_part == weights.end() ||
+                b_part == weights.end() || a_part == weights.end()) {
+                return;
+            }
+            joined.clear();
+            joined.push_back(std::move(qkv_part->second));
+            joined.push_back(std::move(z_part->second));
+            joined.push_back(std::move(b_part->second));
+            joined.push_back(std::move(a_part->second));
+            weights.erase(qkv_part);
+            weights.erase(z_part);
+            weights.erase(b_part);
+            weights.erase(a_part);
+            weights.insert_or_assign(fused_prefix + suffix, mx::concatenate(joined, 0));
+        };
+
+        fuse_optional(".scales");
+        fuse_optional(".biases");
+        fuse_optional(".bias");
+    }
+
+    // Fuse dense SwiGLU gate/up projections where they are regular linear
+    // layers. Routed experts stay separate because SwitchGLU uses gather_qmm.
+    auto fuse_gate_up = [&](const std::string& prefix) {
+        std::string gate_prefix = prefix + "gate_proj";
+        std::string up_prefix = prefix + "up_proj";
+        std::string gate_up_prefix = prefix + "gate_up_proj";
+
+        auto gate_weight = weights.find(gate_prefix + ".weight");
+        auto up_weight = weights.find(up_prefix + ".weight");
+        if (gate_weight == weights.end() || up_weight == weights.end()) {
+            return;
+        }
+
+        std::vector<mx::array> joined;
+        joined.push_back(std::move(gate_weight->second));
+        joined.push_back(std::move(up_weight->second));
+        weights.erase(gate_weight);
+        weights.erase(up_weight);
+        weights.insert_or_assign(gate_up_prefix + ".weight", mx::concatenate(joined, 0));
+
+        auto gate_scales = weights.find(gate_prefix + ".scales");
+        auto up_scales = weights.find(up_prefix + ".scales");
+        if (gate_scales != weights.end() && up_scales != weights.end()) {
+            joined.clear();
+            joined.push_back(std::move(gate_scales->second));
+            joined.push_back(std::move(up_scales->second));
+            weights.erase(gate_scales);
+            weights.erase(up_scales);
+            weights.insert_or_assign(gate_up_prefix + ".scales", mx::concatenate(joined, 0));
+        }
+
+        auto gate_biases = weights.find(gate_prefix + ".biases");
+        auto up_biases = weights.find(up_prefix + ".biases");
+        if (gate_biases != weights.end() && up_biases != weights.end()) {
+            joined.clear();
+            joined.push_back(std::move(gate_biases->second));
+            joined.push_back(std::move(up_biases->second));
+            weights.erase(gate_biases);
+            weights.erase(up_biases);
+            weights.insert_or_assign(gate_up_prefix + ".biases", mx::concatenate(joined, 0));
+        }
+    };
+
+    for (int l = 0; l < config_.num_hidden_layers; ++l) {
+        std::string mlp_prefix = "model.layers." + std::to_string(l) + ".mlp.";
+        fuse_gate_up(mlp_prefix);
+        fuse_gate_up(mlp_prefix + "shared_expert.");
+    }
 
     // Split fused gate_up_proj into separate gate_proj + up_proj
     // Swift: experts.gate_up_proj -> split at mid -> gate_proj + up_proj
@@ -757,10 +1045,22 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
         }
     }
 
-    // Fix conv1d weight ordering
+    // Raw HF Qwen3.5 stores standard RMSNorm weights in scale-shift form.
+    // MLX quantized exports may already store direct scales, so gate this on
+    // raw/MTP-style checkpoint layout detected above.
+    // GatedDeltaNet's linear_attn.norm.weight is already a direct scale.
     for (auto& [key, value] : weights) {
         if (key.find("conv1d.weight") != std::string::npos && value.shape(-1) != 1) {
             value = mx::moveaxis(value, 2, 1);
+            continue;
+        }
+        if (should_shift_norm_weights &&
+            key.size() >= std::string("norm.weight").size() &&
+            key.compare(key.size() - std::string("norm.weight").size(),
+                        std::string("norm.weight").size(),
+                        "norm.weight") == 0 &&
+            key.find("linear_attn.norm.weight") == std::string::npos) {
+            value = mx::add(value, mx::array(1.0f));
         }
     }
 

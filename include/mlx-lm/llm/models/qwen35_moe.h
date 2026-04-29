@@ -62,8 +62,8 @@ class Qwen35MoEAttention {
     int head_dim_;
     float scale_;
 
-    mlx::core::array q_proj_weight_, k_proj_weight_, v_proj_weight_, o_proj_weight_;
-    std::optional<mlx::core::array> q_proj_bias_, k_proj_bias_, v_proj_bias_, o_proj_bias_;
+    mlx::core::array qkv_proj_weight_, o_proj_weight_;
+    std::optional<mlx::core::array> qkv_proj_bias_, o_proj_bias_;
     mlx::core::array q_norm_weight_, k_norm_weight_;
     float rms_norm_eps_;
     float rope_theta_;
@@ -90,10 +90,7 @@ class Qwen35MoEGatedDeltaNet {
     int conv_dim_;
 
     mlx::core::array conv1d_weight_;
-    mlx::core::array in_proj_qkv_weight_;
-    mlx::core::array in_proj_z_weight_;
-    mlx::core::array in_proj_b_weight_;
-    mlx::core::array in_proj_a_weight_;
+    mlx::core::array in_proj_qkv_z_ba_weight_;
     mlx::core::array dt_bias_;
     mlx::core::array a_log_;
     Qwen3NextRMSNormGated norm_;
@@ -109,7 +106,7 @@ public:
 
 // Dense MLP (reuses gate/up/down pattern)
 class Qwen35MoEMLP {
-    mlx::core::array gate_proj_weight_, down_proj_weight_, up_proj_weight_;
+    mlx::core::array gate_up_proj_weight_, down_proj_weight_;
 
 public:
     Qwen35MoEMLP(int dimensions, int hidden_dimensions);

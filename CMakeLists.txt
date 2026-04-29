@@ -41,6 +41,7 @@ FetchContent_Declare(
     # lemon-mlx-engine#19 discussion.
     GIT_TAG        39fac95d901c72175fce4baf973e375d4a054ba7
     GIT_SHALLOW    FALSE
+    PATCH_COMMAND  /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/patches/apply_mlx_rocm_patches.sh" "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 FetchContent_MakeAvailable(mlx)
 
@@ -225,6 +226,9 @@ target_include_directories(mlx-lm-common PUBLIC ${stb_SOURCE_DIR})
 if(MLX_LM_BUILD_EXAMPLES)
     add_executable(chat examples/chat.cpp)
     target_link_libraries(chat PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core)
+
+    add_executable(bench examples/bench.cpp)
+    target_link_libraries(bench PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core)
 
     add_executable(diagnose examples/diagnose.cpp)
     target_link_libraries(diagnose PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core)

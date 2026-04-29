@@ -1,0 +1,21 @@
+diff --git a/mlx/backend/rocm/quantized/qmm.hip b/mlx/backend/rocm/quantized/qmm.hip
+index e6758519..478c92c4 100644
+--- a/mlx/backend/rocm/quantized/qmm.hip
++++ b/mlx/backend/rocm/quantized/qmm.hip
+@@ -2939,8 +2939,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   // Ensure N alignment
+   while (tile_n > 1 && N % tile_n != 0) tile_n /= 2;
+ 
+-  static bool use_tiled = (std::getenv("MLX_ROCM_QMV_NO_TILED") == nullptr);
+-  if (use_tiled && use_fast_qmv && !can_use_batched_qmv &&
++  // The tiled QMV path is not reliable on gfx1151 for Qwen3.5 decode
++  // shapes: default 8-bit tiling can hang, and forced 4/8-bit tile
++  // sizes can return wrong logits. Keep it opt-in while the tiled kernel
++  // is fixed; the warp/shared path is slower but coherent.
++  static bool use_tiled = (std::getenv("MLX_ROCM_QMV_ENABLE_TILED") != nullptr) &&
++      (std::getenv("MLX_ROCM_QMV_NO_TILED") == nullptr);
++  bool use_tiled_qmv = use_tiled;
++  if (use_tiled_qmv && use_fast_qmv && !can_use_batched_qmv &&
+       tile_n >= 8 && mode_ == QuantizationMode::Affine) {
+     enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr, tile_n](hipStream_t stream) {
+       dim3 tiled_block(WARP_SIZE, tile_n);

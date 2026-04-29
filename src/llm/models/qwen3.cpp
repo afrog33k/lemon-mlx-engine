@@ -4,6 +4,7 @@
 #include <mlx-lm/common/attention_utils.h>
 #include <mlx-lm/common/activations.h>
 #include <cmath>
+#include <cstdlib>
 #include <mlx-lm/common/quantized_linear.h>
 
 namespace mx = mlx::core;
@@ -37,6 +38,19 @@ static mx::array linear_fwd(const mx::array& x, const mx::array& w) {
     return linear_forward(x, w);
 }
 
+static bool project_only_last_token_for_generation() {
+    const char* raw = std::getenv("LEMON_MLX_FULL_PREFILL_LOGITS");
+    return !(raw && raw[0] == '1' && raw[1] == '\0');
+}
+
+static mx::array last_token_hidden_for_generation(const mx::array& x) {
+    if (!project_only_last_token_for_generation() || x.ndim() != 3 || x.shape(1) <= 1) {
+        return x;
+    }
+    int seq_len = x.shape(1);
+    return mx::slice(x, {0, seq_len - 1, 0}, {x.shape(0), seq_len, x.shape(2)});
+}
+
 // --- Qwen3Attention ---
 
 Qwen3Attention::Qwen3Attention(const Qwen3Configuration& args)
@@ -44,9 +58,9 @@ Qwen3Attention::Qwen3Attention(const Qwen3Configuration& args)
       num_kv_heads_(args.num_key_value_heads),
       head_dim_(args.head_dim),
       scale_(std::pow(static_cast<float>(args.head_dim), -0.5f)),
-      wq_weight_(mx::zeros({args.num_attention_heads * args.head_dim, args.hidden_size})),
-      wk_weight_(mx::zeros({args.num_key_value_heads * args.head_dim, args.hidden_size})),
-      wv_weight_(mx::zeros({args.num_key_value_heads * args.head_dim, args.hidden_size})),
+      wqkv_weight_(mx::zeros({
+          (args.num_attention_heads + 2 * args.num_key_value_heads) * args.head_dim,
+          args.hidden_size})),
       wo_weight_(mx::zeros({args.hidden_size, args.num_attention_heads * args.head_dim})),
       q_norm_weight_(mx::ones({args.head_dim})),
       k_norm_weight_(mx::ones({args.head_dim})),
@@ -69,9 +83,12 @@ Qwen3Attention::Qwen3Attention(const Qwen3Configuration& args)
 mx::array Qwen3Attention::operator()(const mx::array& x, const AttentionMask& mask, KVCache* cache) {
     int B = x.shape(0), L = x.shape(1);
 
-    auto queries = linear_fwd(x, wq_weight_);
-    auto keys = linear_fwd(x, wk_weight_);
-    auto values = linear_fwd(x, wv_weight_);
+    auto qkv = linear_fwd(x, wqkv_weight_);
+    int q_dim = num_heads_ * head_dim_;
+    int kv_dim = num_kv_heads_ * head_dim_;
+    auto queries = mx::slice(qkv, {0, 0, 0}, {B, L, q_dim});
+    auto keys = mx::slice(qkv, {0, 0, q_dim}, {B, L, q_dim + kv_dim});
+    auto values = mx::slice(qkv, {0, 0, q_dim + kv_dim}, {B, L, q_dim + 2 * kv_dim});
 
     // Reshape and apply Q/K norms before transpose
     queries = mx::reshape(queries, {B, L, num_heads_, -1});
@@ -100,9 +117,7 @@ mx::array Qwen3Attention::operator()(const mx::array& x, const AttentionMask& ma
 
 std::unordered_map<std::string, mx::array*> Qwen3Attention::weight_map() {
     return {
-        {"q_proj.weight", &wq_weight_},
-        {"k_proj.weight", &wk_weight_},
-        {"v_proj.weight", &wv_weight_},
+        {"qkv_proj.weight", &wqkv_weight_},
         {"o_proj.weight", &wo_weight_},
         {"q_norm.weight", &q_norm_weight_},
         {"k_norm.weight", &k_norm_weight_},
@@ -112,22 +127,20 @@ std::unordered_map<std::string, mx::array*> Qwen3Attention::weight_map() {
 // --- Qwen3MLP ---
 
 Qwen3MLP::Qwen3MLP(int dimensions, int hidden_dimensions)
-    : gate_weight_(mx::zeros({hidden_dimensions, dimensions})),
-      down_weight_(mx::zeros({dimensions, hidden_dimensions})),
-      up_weight_(mx::zeros({hidden_dimensions, dimensions}))
+    : gate_up_weight_(mx::zeros({2 * hidden_dimensions, dimensions})),
+      down_weight_(mx::zeros({dimensions, hidden_dimensions}))
 {}
 
 mx::array Qwen3MLP::operator()(const mx::array& x) {
-    auto g = linear_fwd(x, gate_weight_);
-    auto up = linear_fwd(x, up_weight_);
-    return linear_fwd(swiglu(g, up), down_weight_);
+    auto gate_up = linear_fwd(x, gate_up_weight_);
+    auto parts = mx::split(gate_up, 2, -1);
+    return linear_fwd(swiglu(parts[0], parts[1]), down_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen3MLP::weight_map() {
     return {
-        {"gate_proj.weight", &gate_weight_},
+        {"gate_up_proj.weight", &gate_up_weight_},
         {"down_proj.weight", &down_weight_},
-        {"up_proj.weight", &up_weight_},
     };
 }
 
@@ -170,7 +183,7 @@ Qwen3ModelInner::Qwen3ModelInner(const Qwen3Configuration& args)
 }
 
 mx::array Qwen3ModelInner::operator()(const mx::array& inputs, std::vector<KVCache>* cache) {
-    auto h = mx::take(embed_tokens_weight_, inputs, 0);
+    auto h = embedding_forward(embed_tokens_weight_, inputs);
     auto mask = create_attention_mask(h, cache && !cache->empty() ? &(*cache)[0] : nullptr);
     for (size_t i = 0; i < layers_.size(); ++i) {
         KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
@@ -180,7 +193,7 @@ mx::array Qwen3ModelInner::operator()(const mx::array& inputs, std::vector<KVCac
 }
 
 mx::array Qwen3ModelInner::embed_as_linear(const mx::array& x) const {
-    return mx::matmul(x, mx::transpose(embed_tokens_weight_));
+    return linear_fwd(x, embed_tokens_weight_);
 }
 
 std::unordered_map<std::string, mx::array*> Qwen3ModelInner::weight_map() {
@@ -215,6 +228,7 @@ LMOutput Qwen3Model::call_impl(const LMInput::Text& input, std::vector<KVCache>*
 
 mx::array Qwen3Model::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
     auto out = model_(inputs, cache);
+    out = last_token_hidden_for_generation(out);
     if (lm_head_weight_.has_value()) return linear_fwd(out, lm_head_weight_.value());
     return model_.embed_as_linear(out);
 }
@@ -222,6 +236,97 @@ mx::array Qwen3Model::forward_impl(const mx::array& inputs, std::vector<KVCache>
 std::unordered_map<std::string, mx::array>
 Qwen3Model::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
     if (config_.tie_word_embeddings) weights.erase("lm_head.weight");
+
+    for (int l = 0; l < config_.num_hidden_layers; ++l) {
+        std::string attn_prefix = "model.layers." + std::to_string(l) + ".self_attn.";
+        std::string q_prefix = attn_prefix + "q_proj";
+        std::string k_prefix = attn_prefix + "k_proj";
+        std::string v_prefix = attn_prefix + "v_proj";
+        std::string qkv_prefix = attn_prefix + "qkv_proj";
+
+        auto q_weight = weights.find(q_prefix + ".weight");
+        auto k_weight = weights.find(k_prefix + ".weight");
+        auto v_weight = weights.find(v_prefix + ".weight");
+        if (q_weight != weights.end() && k_weight != weights.end() && v_weight != weights.end()) {
+            std::vector<mx::array> joined;
+            joined.push_back(std::move(q_weight->second));
+            joined.push_back(std::move(k_weight->second));
+            joined.push_back(std::move(v_weight->second));
+            weights.erase(q_weight);
+            weights.erase(k_weight);
+            weights.erase(v_weight);
+            weights.insert_or_assign(qkv_prefix + ".weight", mx::concatenate(joined, 0));
+
+            auto q_scales = weights.find(q_prefix + ".scales");
+            auto k_scales = weights.find(k_prefix + ".scales");
+            auto v_scales = weights.find(v_prefix + ".scales");
+            if (q_scales != weights.end() && k_scales != weights.end() && v_scales != weights.end()) {
+                joined.clear();
+                joined.push_back(std::move(q_scales->second));
+                joined.push_back(std::move(k_scales->second));
+                joined.push_back(std::move(v_scales->second));
+                weights.erase(q_scales);
+                weights.erase(k_scales);
+                weights.erase(v_scales);
+                weights.insert_or_assign(qkv_prefix + ".scales", mx::concatenate(joined, 0));
+            }
+
+            auto q_biases = weights.find(q_prefix + ".biases");
+            auto k_biases = weights.find(k_prefix + ".biases");
+            auto v_biases = weights.find(v_prefix + ".biases");
+            if (q_biases != weights.end() && k_biases != weights.end() && v_biases != weights.end()) {
+                joined.clear();
+                joined.push_back(std::move(q_biases->second));
+                joined.push_back(std::move(k_biases->second));
+                joined.push_back(std::move(v_biases->second));
+                weights.erase(q_biases);
+                weights.erase(k_biases);
+                weights.erase(v_biases);
+                weights.insert_or_assign(qkv_prefix + ".biases", mx::concatenate(joined, 0));
+            }
+        }
+
+        std::string prefix = "model.layers." + std::to_string(l) + ".mlp.";
+        std::string gate_prefix = prefix + "gate_proj";
+        std::string up_prefix = prefix + "up_proj";
+        std::string gate_up_prefix = prefix + "gate_up_proj";
+
+        auto gate_weight = weights.find(gate_prefix + ".weight");
+        auto up_weight = weights.find(up_prefix + ".weight");
+        if (gate_weight == weights.end() || up_weight == weights.end()) {
+            continue;
+        }
+
+        std::vector<mx::array> joined;
+        joined.push_back(std::move(gate_weight->second));
+        joined.push_back(std::move(up_weight->second));
+        weights.erase(gate_weight);
+        weights.erase(up_weight);
+        weights.insert_or_assign(gate_up_prefix + ".weight", mx::concatenate(joined, 0));
+
+        auto gate_scales = weights.find(gate_prefix + ".scales");
+        auto up_scales = weights.find(up_prefix + ".scales");
+        if (gate_scales != weights.end() && up_scales != weights.end()) {
+            joined.clear();
+            joined.push_back(std::move(gate_scales->second));
+            joined.push_back(std::move(up_scales->second));
+            weights.erase(gate_scales);
+            weights.erase(up_scales);
+            weights.insert_or_assign(gate_up_prefix + ".scales", mx::concatenate(joined, 0));
+        }
+
+        auto gate_biases = weights.find(gate_prefix + ".biases");
+        auto up_biases = weights.find(up_prefix + ".biases");
+        if (gate_biases != weights.end() && up_biases != weights.end()) {
+            joined.clear();
+            joined.push_back(std::move(gate_biases->second));
+            joined.push_back(std::move(up_biases->second));
+            weights.erase(gate_biases);
+            weights.erase(up_biases);
+            weights.insert_or_assign(gate_up_prefix + ".biases", mx::concatenate(joined, 0));
+        }
+    }
+
     return weights;
 }
 
