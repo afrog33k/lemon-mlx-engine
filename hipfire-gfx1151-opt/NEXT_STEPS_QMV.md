@@ -2,7 +2,7 @@
 
 ## Summary
 
-Tested QMV optimization options for lemon-mlx-engine on gfx1151. Profiled both lemon-mlx-engine and hipfire to identify bottlenecks. Found that `MLX_ROCM_QMV_COLS_PER_BLOCK=64` provides a ~2% improvement, but the fundamental gap is due to different quantization formats.
+Tested QMV optimization options for lemon-mlx-engine on gfx1151. Profiled both lemon-mlx-engine and hipfire to identify bottlenecks. Found that `MLX_ROCM_QMV_COLS_PER_BLOCK=64` provides a ~2% improvement, but the fundamental gap is due to group_size difference (64 vs 256).
 
 ## Benchmark Results
 
@@ -38,20 +38,21 @@ Top kernels (1 step, ctx=32):
 - Profiled under a different name
 - Fused with another operation
 
-## Root Cause: Quantization Format Difference
+## Root Cause: group_size Difference
 
 | Aspect | Lemon MLX | Hipfire |
 |--------|-----------|----------|
-| Format | affine int4 group64 | MQ4G256 (FWHT-rotated) |
+| Format | affine int4 | MQ4G256 (FWHT-rotated) |
 | Group size | 64 | 256 |
 | Scale/bias loads | 4x more | 1x |
 | Kernel | MLX QMV | Custom MQ4 kernel |
 | lm_head time | 1297 us/call | <50 us (estimated) |
 
-**The MQ4 format has fundamental advantages:**
+**The key difference is group_size:**
 1. **Group size 256**: 4x fewer scale/bias loads = better memory bandwidth
-2. **FWHT rotation**: Pre-rotated weights = simpler inner loop
-3. **Specialized kernel**: Optimized for decode, not general GEMV
+2. For lm_head with N=248320, K=1024:
+   - MLX (gs=64): 16 groups/row × 248320 columns = ~4M scale/bias loads
+   - Hipfire (gs=256): 4 groups/row × 248320 columns = ~1M scale/bias loads
 
 ## Performance Gap Breakdown
 
@@ -65,25 +66,25 @@ The remaining 60% gap comes from other projections also benefiting from MQ4 form
 
 ## Recommended Next Steps
 
-### Option 1: Add MQ4G256/FWHT support to MLX (high impact, high effort)
+### Option 1: Re-quantize model with group_size=256 (high impact, medium effort)
+- **Status**: MLX kernel support added (commit 65b40a9)
+- Remaining: Re-quantize Qwen3.5-0.8B model with group_size=256
+- Requires access to FP32 source weights
+- **Estimated impact**: 20-40% overall speedup (lm_head 3-4x faster)
+
+### Option 2: Add MQ4G256/FWHT support to MLX (high impact, high effort)
 - Implement FWHT rotation in MLX
 - Add MQ4 dequantization kernel
 - Would enable exact artifact parity with hipfire
 - **Estimated impact**: 1.5-2x speedup
-
-### Option 2: Increase group_size for large-N (medium impact, low effort)
-- Use group_size=256 for tied lm-head (N=248320)
-- Fewer scale/bias loads = better bandwidth
-- Requires MLX backend change
-- **Estimated impact**: 10-20% speedup on lm_head
 
 ### Option 3: Specialized tied lm-head kernel (medium impact, medium effort)
 - For M=1, very large N (vocab), consider top-k/argmax
 - Avoid computing full logits for greedy sampling
 - **Estimated impact**: 30-50% speedup on lm_head for greedy
 
-### Option 4: Accept current format difference
-- Document that MQ4 is fundamentally faster
+### Option 4: Accept current constraints
+- Document that hipfire's MQ4 format is fundamentally faster
 - Focus on improving MLX within its format constraints
 - cols64 setting already provides ~2% improvement
 
