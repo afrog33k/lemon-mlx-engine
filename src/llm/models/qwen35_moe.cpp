@@ -124,19 +124,25 @@ static mx::array linear_fwd(const mx::array& x, const mx::array& w,
 }
 
 static bool project_only_last_token_for_generation() {
-    const char* raw = std::getenv("LEMON_MLX_FULL_PREFILL_LOGITS");
-    return !(raw && raw[0] == '1' && raw[1] == '\0');
+    static const bool enabled = [] {
+        const char* raw = std::getenv("LEMON_MLX_FULL_PREFILL_LOGITS");
+        return !(raw && raw[0] == '1' && raw[1] == '\0');
+    }();
+    return enabled;
 }
 
 static bool qwen35_decode_fastpath_enabled() {
-    if (qwen35_env_enabled("LEMON_MLX_QWEN35_DISABLE_DECODE_FASTPATH")) {
-        return false;
-    }
-    const char* raw = std::getenv("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
-    if (raw) {
-        return qwen35_env_enabled("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
-    }
-    return true;
+    static const bool enabled = [] {
+        if (qwen35_env_enabled("LEMON_MLX_QWEN35_DISABLE_DECODE_FASTPATH")) {
+            return false;
+        }
+        const char* raw = std::getenv("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
+        if (raw) {
+            return qwen35_env_enabled("LEMON_MLX_QWEN35_ENABLE_DECODE_FASTPATH");
+        }
+        return true;
+    }();
+    return enabled;
 }
 
 static mx::array last_token_hidden_for_generation(const mx::array& x) {
@@ -272,8 +278,10 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     const std::optional<mx::array>& mask,
     MambaCache* cache)
 {
-    auto debug_eval = [](const char* label, const mx::array& value) {
-        if (!qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_GDN")) {
+    const bool eval_gdn = qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_GDN");
+    const bool decode_fastpath = qwen35_decode_fastpath_enabled();
+    auto debug_eval = [eval_gdn](const char* label, const mx::array& value) {
+        if (!eval_gdn) {
             return;
         }
         std::cerr << "[qwen35-debug] eval gdn " << label << " begin" << std::endl;
@@ -325,8 +333,8 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     // T=1 decode fast path. It matches the reference path on the Qwen3.5
     // BF16/dequant/native smoke and quant-forward parity gates; keep env
     // controls for targeted bisects.
-    if (qwen35_decode_fastpath_enabled() &&
-        S == 1 && cache && (*cache)[0].has_value() && conv_input.shape(1) == conv_kernel_size_) {
+    if (decode_fastpath && S == 1 && cache && (*cache)[0].has_value() &&
+        conv_input.shape(1) == conv_kernel_size_) {
         // Fused conv1d + silu
         auto w = mx::reshape(
             mx::transpose(mx::reshape(conv1d_weight_, {conv_dim_, conv_kernel_size_})),
@@ -641,8 +649,8 @@ Qwen35MoEModelInner::Qwen35MoEModelInner(const Qwen35MoEConfiguration& args)
 }
 
 mx::array Qwen35MoEModelInner::operator()(const mx::array& inputs, std::vector<KVCache>* cache) {
-    const bool eval_layers = qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_LAYERS");
-    const int max_layers = qwen35_env_int("LEMON_MLX_QWEN35_MAX_LAYERS", -1);
+    static const bool eval_layers = qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_LAYERS");
+    static const int max_layers = qwen35_env_int("LEMON_MLX_QWEN35_MAX_LAYERS", -1);
     auto h = embedding_forward(embed_tokens_weight_, inputs);
     if (eval_layers) {
         std::cerr << "[qwen35-debug] eval embed begin" << std::endl;
@@ -713,14 +721,16 @@ LMOutput Qwen35MoEModel::call_impl(const LMInput::Text& input, std::vector<KVCac
 }
 
 mx::array Qwen35MoEModel::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
+    static const bool eval_body = qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_BODY");
+    static const bool zero_logits = qwen35_env_enabled("LEMON_MLX_QWEN35_ZERO_LOGITS");
     auto out = model_(inputs, cache);
     out = last_token_hidden_for_generation(out);
-    if (qwen35_env_enabled("LEMON_MLX_QWEN35_EVAL_BODY")) {
+    if (eval_body) {
         std::cerr << "[qwen35-debug] eval body begin" << std::endl;
         mx::eval(out);
         std::cerr << "[qwen35-debug] eval body done" << std::endl;
     }
-    if (qwen35_env_enabled("LEMON_MLX_QWEN35_ZERO_LOGITS")) {
+    if (zero_logits) {
         return mx::zeros({out.shape(0), out.shape(1), config_.vocab_size}, out.dtype());
     }
     if (lm_head_weight_.has_value()) return linear_fwd(out, lm_head_weight_.value());
