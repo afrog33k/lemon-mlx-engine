@@ -35,6 +35,7 @@ JOBS="${JOBS:-8}"
 
 LEMON_4BIT_MODEL="${LEMON_4BIT_MODEL:-mlx-community/Qwen3.5-0.8B-MLX-4bit}"
 HIPFIRE_MODEL="${HIPFIRE_MODEL:-qwen3.5:0.8b}"
+SOURCE_MODEL="${SOURCE_MODEL:-Qwen/Qwen3.5-0.8B}"
 EXPECT_SUBSTRING="${EXPECT_SUBSTRING:-return x + y}"
 EXPECT_PREFIX="${EXPECT_PREFIX:-}"
 ATTRACTOR_MIN_TOKENS="${ATTRACTOR_MIN_TOKENS:-16}"
@@ -43,6 +44,7 @@ MAX_TOKEN_RUN="${MAX_TOKEN_RUN:-16}"
 MIN_UNIQUE_TOKEN_RATIO="${MIN_UNIQUE_TOKEN_RATIO:-}"
 REQUIRE_STABLE_LEMON_HASH="${REQUIRE_STABLE_LEMON_HASH:-1}"
 REQUIRE_TOKEN_BUDGET_MATCH="${REQUIRE_TOKEN_BUDGET_MATCH:-1}"
+REQUIRE_EXACT_ARTIFACT_MATCH="${REQUIRE_EXACT_ARTIFACT_MATCH:-0}"
 
 if [[ ! -d "$BUILD_DIR" ]]; then
     echo "missing build directory: $BUILD_DIR" >&2
@@ -84,6 +86,19 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="$OUT_BASE/qwen35_0p8b_vs_hipfire_$stamp"
 mkdir -p "$OUT_DIR"
 
+artifact_audit="$OUT_DIR/artifacts.tsv"
+if [[ -x "$ROOT_DIR/scripts/audit_model_artifacts.py" || -f "$ROOT_DIR/scripts/audit_model_artifacts.py" ]]; then
+    python3 "$ROOT_DIR/scripts/audit_model_artifacts.py" \
+        --source "$SOURCE_MODEL" \
+        --lemon "$LEMON_4BIT_MODEL" \
+        --hipfire "$HIPFIRE_MODEL" \
+        > "$artifact_audit"
+else
+    echo "missing artifact audit script: $ROOT_DIR/scripts/audit_model_artifacts.py" >&2
+    exit 1
+fi
+exact_artifact_match="$(awk -F '\t' '$1 == "exact_artifact_match" {print $2; found=1; exit} END {if (!found) print "unknown"}' "$artifact_audit")"
+
 prompt_arg_file="$OUT_DIR/prompt_arg.txt"
 python3 - "$PROMPT_FILE" "$prompt_arg_file" <<'PY'
 import pathlib
@@ -124,6 +139,9 @@ decode_warmup_steps=$DECODE_WARMUP_STEPS
 decode_token_budgets=$DECODE_TOKEN_BUDGETS
 lemon_4bit_model=$LEMON_4BIT_MODEL
 hipfire_model=$HIPFIRE_MODEL
+source_model=$SOURCE_MODEL
+artifact_audit=$artifact_audit
+exact_artifact_match=$exact_artifact_match
 hipfire_cmd=$hipfire_ref
 hipfire_ref_md5=$hipfire_ref_md5
 expect_prefix=$EXPECT_PREFIX
@@ -134,6 +152,7 @@ max_token_run=$MAX_TOKEN_RUN
 min_unique_token_ratio=$MIN_UNIQUE_TOKEN_RATIO
 require_stable_lemon_hash=$REQUIRE_STABLE_LEMON_HASH
 require_token_budget_match=$REQUIRE_TOKEN_BUDGET_MATCH
+require_exact_artifact_match=$REQUIRE_EXACT_ARTIFACT_MATCH
 lemon_mlx_gdn_enable_hip=${LEMON_MLX_GDN_ENABLE_HIP:-}
 lemon_mlx_gdn_disable_hip=${LEMON_MLX_GDN_DISABLE_HIP:-}
 mlx_rocm_qmv_enable_tiled=${MLX_ROCM_QMV_ENABLE_TILED:-}
@@ -219,6 +238,11 @@ run_hipfire() {
 }
 
 any_failed=0
+if [[ "$REQUIRE_EXACT_ARTIFACT_MATCH" == "1" && "$exact_artifact_match" != "1" ]]; then
+    echo "exact artifact match required but audit reported exact_artifact_match=$exact_artifact_match" >&2
+    echo "see $artifact_audit" >&2
+    exit 1
+fi
 for ((run = 1; run <= RUNS; run += 1)); do
     run_lemon_native "$run" || any_failed=1
     run_hipfire "$run" || any_failed=1
@@ -317,6 +341,33 @@ END {
     }
 }
 ' "$aggregate" > "$findings"
+
+{
+    echo ""
+    echo "## Artifact Audit"
+    echo ""
+    awk -F '\t' '
+    NR == 1 {
+        print "| label | kind | format | primary md5 | size bytes | quant |"
+        print "|---|---|---|---|---:|---|"
+        next
+    }
+    $1 == "exact_artifact_match" {
+        exact = $2
+        next
+    }
+    NF >= 11 {
+        printf "| %s | %s | %s | `%s` | %s | `%s` |\n", $1, $2, $5, $7, $8, $10
+    }
+    END {
+        print ""
+        print "exact_artifact_match: `" (exact == "" ? "unknown" : exact) "`"
+        if (exact != "1") {
+            print ""
+            print "These runs are same-source-family, not same exact artifact: hipfire uses MQ4G256/FWHT-rotated weights while MLX uses its native quantized safetensors format."
+        }
+    }' "$artifact_audit"
+} >> "$findings"
 
 if [[ "$REQUIRE_STABLE_LEMON_HASH" == "1" ]]; then
     lemon_hash_status="$(awk -F '\t' '
