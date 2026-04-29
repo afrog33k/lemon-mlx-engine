@@ -4,6 +4,12 @@
 
 Tested QMV optimization options for lemon-mlx-engine on gfx1151. Profiled both lemon-mlx-engine and hipfire to identify bottlenecks. Found that `MLX_ROCM_QMV_COLS_PER_BLOCK=64` provides a ~2% improvement, but the fundamental gap is due to group_size difference (64 vs 256).
 
+**Update (2026-04-29 18:00 UTC):**
+- Added MLX C++ kernel support for group_size=256 (commit 65b40a9)
+- Added MLX Python support for group_size=256 (mlx-vulkan patch)
+- Created quantization script to convert models to group_size=256
+- **Status**: Kernel changes complete, model re-quantization pending format compatibility testing
+
 ## Benchmark Results
 
 Average decode speed (4 runs, Qwen3.5-0.8B 4-bit, 32 tokens):
@@ -64,13 +70,52 @@ The lm_head alone accounts for ~6.5 ms per 5 steps (1.3 ms/step) in lemon, which
 
 The remaining 60% gap comes from other projections also benefiting from MQ4 format.
 
+## Recent Work (2026-04-29)
+
+### MLX Kernel Support for group_size=256
+**Commit 65b40a9**: Added complete kernel support in `qmm.hip`:
+- `gs256` type alias to DISPATCH_GROUP_SIZE macro
+- `case 256:` to the group_size dispatch switch
+- `group_size_ == 256` to all tiled QMV launch paths
+- Patch application via `patches/apply_qmv_group256.py`
+
+### MLX Python Support for group_size=256
+**MLX-vulkan patch 1eaa39b8**: Modified `mlx/ops.cpp` to accept group_size=256:
+```cpp
+if (group_size != 32 && group_size != 64 && group_size != 128 && group_size != 256)
+```
+
+This enables `mx.quantize(weights, group_size=256, bits=4)` to work correctly.
+
+### Quantization Script
+**Commit 0c670ab**: Created `scripts/quantize_qwen35_group256.py`:
+- Downloads FP32 model from Qwen/Qwen3.5-0.8B
+- Quantizes all Linear/Embedding layers with group_size=256
+- Produces properly formatted safetensors with:
+  - Packed U32 weights (shape: [vocab, hidden/4] vs [vocab, hidden/16])
+  - BF16 scales/biases (shape: [vocab, 4] vs [vocab, 16])
+
+### Model Format Challenge
+The quantized model structure differs from MLX-community format:
+- Original: `language_model.model.*` prefix, 848 tensors
+- New: Additional vision/tower components, 980 tensors
+- **Issue**: `bad_function_call` when loading with lemon-mlx-engine
+- **Root cause**: Model format mismatch (extra keys, structure differences)
+
 ## Recommended Next Steps
 
-### Option 1: Re-quantize model with group_size=256 (high impact, medium effort)
-- **Status**: MLX kernel support added (commit 65b40a9)
-- Remaining: Re-quantize Qwen3.5-0.8B model with group_size=256
-- Requires access to FP32 source weights
-- **Estimated impact**: 20-40% overall speedup (lm_head 3-4x faster)
+### Option 1: Fix model format compatibility (high priority)
+- Re-run quantization filtering only language_model components
+- Match exact key structure of MLX-community model
+- Test with lemon-mlx-engine `bench` binary
+- **Estimated effort**: 2-4 hours
+- **Expected impact**: 20-40% overall speedup once working
+
+### Option 2: Alternative: Test kernel changes directly
+- Write a minimal C++ test that uses group_size=256 quantization
+- Verify the kernel launches and produces correct results
+- **Estimated effort**: 1-2 hours
+- **Purpose**: Validate kernel changes independently
 
 ### Option 2: Add MQ4G256/FWHT support to MLX (high impact, high effort)
 - Implement FWHT rotation in MLX
