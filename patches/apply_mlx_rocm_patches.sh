@@ -13,3 +13,7 @@ do
   fi
   git apply "$patch_file"
 done
+
+# Apply group_size=256 support directly (more reliable than patch file)
+# This adds gs256 type alias, case 256 to switch, and tiled path support
+python3 "$root_dir/patches/apply_qmv_group256.py" "$root_dir"

@@ -1,0 +1,51 @@
+# This patch adds group_size=256 support to MLX QMV kernels.
+# Must be applied AFTER mlx-rocm-gfx1151-disable-qmv-tiled.patch and
+# mlx-rocm-gfx1151-qmv-cols64.patch.
+diff --git a/mlx/backend/rocm/quantized/qmm.hip b/mlx/backend/rocm/quantized/qmm.hip
+index e6758519..12345678 100644
+--- a/mlx/backend/rocm/quantized/qmm.hip
++++ b/mlx/backend/rocm/quantized/qmm.hip
+@@ -2969,14 +2969,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+       if (x.dtype() == bfloat16) {
+         if (bits_ == 4) {
+           if (group_size_ == 32)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 32); }
++          else if (group_size_ == 256) { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 256); }
+           else if (group_size_ == 64)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 64); }
+           else if (group_size_ == 128) { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 128); }
+         } else if (bits_ == 8) {
+           if (group_size_ == 32)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 8, 32); }
++          else if (group_size_ == 256) { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 8, 256); }
+           else if (group_size_ == 64)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 8, 64); }
+           else if (group_size_ == 128) { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 8, 128); }
+         }
+       } else if (x.dtype() == float16) {
+         if (bits_ == 4) {
+           if (group_size_ == 32)  { LAUNCH_TILED(__half, __half, 4, 32); }
++          else if (group_size_ == 256) { LAUNCH_TILED(__half, __half, 4, 256); }
+           else if (group_size_ == 64)  { LAUNCH_TILED(__half, __half, 4, 64); }
+           else if (group_size_ == 128) { LAUNCH_TILED(__half, __half, 4, 128); }
+         } else if (bits_ == 8) {
+           if (group_size_ == 32)  { LAUNCH_TILED(__half, __half, 8, 32); }
++          else if (group_size_ == 256) { LAUNCH_TILED(__half, __half, 8, 256); }
+           else if (group_size_ == 64)  { LAUNCH_TILED(__half, __half, 8, 64); }
+           else if (group_size_ == 128) { LAUNCH_TILED(__half, __half, 8, 128); }
+         }
+       }
+@@ -3397,6 +3403,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     using bits6 = std::integral_constant<int, 6>;
+     using bits8 = std::integral_constant<int, 8>;
+     using gs32 = std::integral_constant<int, 32>;
++    using gs256 = std::integral_constant<int, 256>;
+     using gs64 = std::integral_constant<int, 64>;
+     using gs128 = std::integral_constant<int, 128>;
+
+@@ -3411,6 +3418,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+       case 128:                                              \
+         launch_qmv(type_tag, scale_tag, bits_tag, gs128{});  \
+         break;                                               \
++      case 256:                                              \
++        launch_qmv(type_tag, scale_tag, bits_tag, gs256{});  \
++        break;                                               \
+       default:                                               \
+         throw std::runtime_error(                            \
+             "Unsupported group_size for QuantizedMatmul: " + \
