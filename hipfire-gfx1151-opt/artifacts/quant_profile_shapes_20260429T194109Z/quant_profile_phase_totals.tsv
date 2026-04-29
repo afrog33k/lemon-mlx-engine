@@ -1,0 +1,9 @@
+case	model	table	phase	calls	total_ms	avg_us
+qwen35_0p8b_native4	mlx-community/Qwen3.5-0.8B-MLX-4bit	linear_quantized	decode	389	41.301905	106.175
+qwen3_0p6b_native4	mlx-community/Qwen3-0.6B-4bit	linear_quantized	decode	453	38.065794	84.030
+qwen3_0p6b_native4	mlx-community/Qwen3-0.6B-4bit	linear_quantized	prefill	112	30.238351	269.985
+qwen35_0p8b_native4	mlx-community/Qwen3.5-0.8B-MLX-4bit	linear_quantized	prefill	96	29.366531	305.901
+qwen35_0p8b_native4	mlx-community/Qwen3.5-0.8B-MLX-4bit	embedding_quantized	decode	4	0.458585	114.646
+qwen3_0p6b_native4	mlx-community/Qwen3-0.6B-4bit	embedding_quantized	decode	4	0.443057	110.764
+qwen35_0p8b_native4	mlx-community/Qwen3.5-0.8B-MLX-4bit	embedding_quantized	prefill	1	0.347460	347.460
+qwen3_0p6b_native4	mlx-community/Qwen3-0.6B-4bit	embedding_quantized	prefill	1	0.217973	217.973

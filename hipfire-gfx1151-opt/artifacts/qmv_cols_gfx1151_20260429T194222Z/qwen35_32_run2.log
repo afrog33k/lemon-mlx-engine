@@ -1,0 +1,2 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+mlx-community/Qwen3.5-0.8B-MLX-4bit	2b28c8c6f9cb8944	23	56	1	56	664.22	121.94	0.03	0.46	0.59	0.14	1	992eefdcb4e29cfe	ok	    return x + y\n\n\ndef main():\n    """\n    Main function to test the add function.\n    """\n    x = 5\n    y = 3\n    print(x + y)\n\n\nif __name__ == "__main__":\n   	b7eb276d3d485aa0

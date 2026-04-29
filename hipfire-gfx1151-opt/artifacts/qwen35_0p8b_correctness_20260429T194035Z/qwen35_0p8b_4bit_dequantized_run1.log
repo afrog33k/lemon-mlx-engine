@@ -1,0 +1,10 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+[bench-output run=1]     return x + y
+
+
+def sub(x, y):
+    """
+    Return the difference between x and y.
+    """
+    return x
+mlx-community/Qwen3.5-0.8B-MLX-4bit	2b28c8c6f9cb8944	23	32	1	32	656.77	95.63	0.04	0.33	0.59	0.16	1	f68df19f930bcc8e	ok	    return x + y\n\n\ndef sub(x, y):\n    """\n    Return the difference between x and y.\n    """\n    return x	835c7c9ec95e6580

@@ -1,0 +1,14 @@
+[free -h]
+               total        used        free      shared  buff/cache   available
+Mem:           124Gi        14Gi        57Gi        21Mi        54Gi       110Gi
+Swap:           95Gi        10Gi        85Gi
+
+[rocm-smi --showmeminfo vram]
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 1073741824
+GPU[0]		: VRAM Total Used Memory (B): 154923008
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

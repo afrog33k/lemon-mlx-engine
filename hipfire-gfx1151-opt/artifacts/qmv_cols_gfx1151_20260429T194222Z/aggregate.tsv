@@ -1,0 +1,9 @@
+case	variant	cols_per_block	model	runs	ok_runs	median_decode_tok_s	min_decode_tokens	max_decode_tokens	stable_output_hash	output_hashes	stable_token_hash	token_hashes	status
+qwen3	16	16	mlx-community/Qwen3-0.6B-4bit	2	2	147.180	128	128	1	87ef49230b710eba	1	957b23c26264b398	ok
+qwen3	32	32	mlx-community/Qwen3-0.6B-4bit	2	2	151.200	128	128	1	87ef49230b710eba	1	957b23c26264b398	ok
+qwen3	64	64	mlx-community/Qwen3-0.6B-4bit	2	2	154.160	128	128	1	87ef49230b710eba	1	957b23c26264b398	ok
+qwen3	default	default	mlx-community/Qwen3-0.6B-4bit	2	2	154.950	128	128	1	87ef49230b710eba	1	957b23c26264b398	ok
+qwen35	16	16	mlx-community/Qwen3.5-0.8B-MLX-4bit	2	2	116.280	56	56	1	992eefdcb4e29cfe	1	b7eb276d3d485aa0	ok
+qwen35	32	32	mlx-community/Qwen3.5-0.8B-MLX-4bit	2	2	122.870	56	56	1	992eefdcb4e29cfe	1	b7eb276d3d485aa0	ok
+qwen35	64	64	mlx-community/Qwen3.5-0.8B-MLX-4bit	2	2	127.090	56	56	1	992eefdcb4e29cfe	1	b7eb276d3d485aa0	ok
+qwen35	default	default	mlx-community/Qwen3.5-0.8B-MLX-4bit	2	2	127.900	56	56	1	992eefdcb4e29cfe	1	b7eb276d3d485aa0	ok

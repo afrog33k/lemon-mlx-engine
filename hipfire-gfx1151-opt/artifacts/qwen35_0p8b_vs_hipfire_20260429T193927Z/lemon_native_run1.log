@@ -1,0 +1,17 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+[bench-output run=1]
+    return x + y
+
+
+def main():
+    """
+    Main function to test the add function.
+    """
+    x = 5
+    y = 3
+    print(x + y)
+
+
+if __name__ == "__main__":
+
+mlx-community/Qwen3.5-0.8B-MLX-4bit	12535984df0787a6	22	56	1	56	635.52	125.86	0.03	0.44	0.59	0.14	1	76687d3b8f06a382	ok	\n    return x + y\n\n\ndef main():\n    """\n    Main function to test the add function.\n    """\n    x = 5\n    y = 3\n    print(x + y)\n\n\nif __name__ == "__main__":\n	dfad2eee09ce1f6f

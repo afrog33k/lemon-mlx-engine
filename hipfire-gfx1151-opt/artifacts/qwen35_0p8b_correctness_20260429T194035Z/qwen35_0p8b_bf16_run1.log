@@ -1,0 +1,9 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+[bench-output run=1]     return x + y
+
+def subtract(x, y):
+    """
+    Return the difference of x and y.
+    """
+    return x
+Qwen/Qwen3.5-0.8B	2b28c8c6f9cb8944	23	32	1	32	416.138	29.0429	0.0552702	1.10182	0.59375	0.15625	1	1e3f5899349a760d	ok	    return x + y\n\ndef subtract(x, y):\n    """\n    Return the difference of x and y.\n    """\n    return x	168d17d561f27c21

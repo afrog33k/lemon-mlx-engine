@@ -1,0 +1,3 @@
+case	model	prompt_md5	binary_md5	run	exit_code	status	decode_tok_s	decode_tokens	output_hash	log
+qwen35_0p8b_native4	mlx-community/Qwen3.5-0.8B-MLX-4bit	6a9046339c4d28146b2e7cc66eb1f691	1ea3b388e333ff017a7687d73a0c3e26	1	0	ok	130.77	5	e300c83b71243113	/home/reckon/projects/lemon-mlx-engine/.codeinsight+research/quant_profile_shapes_20260429T194109Z/qwen35_0p8b_native4_run1.log
+qwen3_0p6b_native4	mlx-community/Qwen3-0.6B-4bit	6a9046339c4d28146b2e7cc66eb1f691	1ea3b388e333ff017a7687d73a0c3e26	1	0	ok	140.57	5	e300c83b71243113	/home/reckon/projects/lemon-mlx-engine/.codeinsight+research/quant_profile_shapes_20260429T194109Z/qwen3_0p6b_native4_run1.log

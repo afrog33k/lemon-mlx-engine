@@ -1,0 +1,5 @@
+label	kind	model	resolved	format	primary_file	primary_md5	primary_bytes	source_model_type	quant	tie_word_embeddings
+source	hf_or_mlx	Qwen/Qwen3.5-0.8B	/home/reckon/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17	safetensors	/home/reckon/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors-00001-of-00001.safetensors	7d61ccb37ef5d4ad330fec4ad0e06934	1746942600	qwen3_5	none	True
+lemon	hf_or_mlx	mlx-community/Qwen3.5-0.8B-MLX-4bit	/home/reckon/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-MLX-4bit/snapshots/main	safetensors	/home/reckon/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-MLX-4bit/snapshots/main/model.safetensors	439d1796c1a3ce24ef83681eabd656db	625229487	qwen3_5	{"bits": 4, "group_size": 64, "mode": "affine"}	True
+hipfire	hipfire	qwen3.5:0.8b	/home/reckon/.hipfire/models/qwen3.5-0.8b.mq4	mq4	/home/reckon/.hipfire/models/qwen3.5-0.8b.mq4	0769fdeaa08e82bd6ed555e3f151d04b	549221504	qwen3_5	{"bits": 4, "group_size": 256, "mode": "magnumquant_fwht_rotated", "runtime_dtype": "MQ4G256"}
+exact_artifact_match	0

@@ -19,7 +19,8 @@ static bool gdn_env_enabled(const char* name) {
 // ---------------------------------------------------------------------------
 // Fused HIP kernel for gated delta recurrence.
 // Ports the Metal kernel from GatedDelta.swift to HIP/ROCm.
-// Grid: (1, ceil(Dv/4), B*Hv), ThreadGroup: (32, 4, 1)
+// MLX custom CUDA/HIP kernels take the grid in total threads, not blocks:
+// Grid: (32, ceil(Dv/4)*4, B*Hv), ThreadGroup: (32, 4, 1)
 // Each threadIdx.y row handles one Dv row. Reductions use shared memory so the
 // result is independent of whether the device schedules wave32 or wave64.
 // ---------------------------------------------------------------------------
@@ -152,8 +153,8 @@ static std::pair<mx::array, mx::array> gated_delta_kernel(
         {q, k, v, g, beta, state, mx::array(T)},
         {{B, T, Hv, Dv}, state.shape()},
         {input_type, input_type},
-        {1, (Dv + 3) / 4, B * Hv},  // grid; block.y covers four Dv rows
-        {32, 4, 1},                 // threadGroup
+        {32, ((Dv + 3) / 4) * 4, B * Hv},  // grid in threads
+        {32, 4, 1},                         // threadGroup
         {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
         std::nullopt,           // init_value
         true,                   // ensure_row_contiguous

@@ -1,0 +1,2 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+mlx-community/Qwen3-0.6B-4bit	2b28c8c6f9cb8944	19	128	1	128	537.96	147.27	0.04	0.87	0.28	0.09	1	87ef49230b710eba	ok	    return x + y\n\n# Example usage\nresult = add(5, 3)\nprint(result)  # Output: 8\n\n# Example usage with negative numbers\nresult = add(-5, 3)\nprint(result)  # Output: -2\n\n# Example usage with zero\nresult = add(0, 0)\nprint(result)  	957b23c26264b398

@@ -221,7 +221,17 @@ mx::array Qwen35GatedDeltaNet::operator()(
         auto ssm_state = (*cache)[1].has_value() ? (*cache)[1].value()
                            : mx::zeros({B, num_v_heads_, head_v_dim_, head_k_dim_}, dtype);
 
-        int rep = num_v_heads_ / num_k_heads_;
+        if (qwen35_env_enabled("LEMON_MLX_GDN_ENABLE_HIP") ||
+            qwen35_env_enabled("LEMON_MLX_QWEN35_USE_COMMON_GDN")) {
+            auto [out, new_state] = gated_delta_update(
+                q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state, std::nullopt);
+            (*cache)[1] = new_state;
+
+            // Gated norm + output projection
+            auto normalized = norm_(out, z);
+            return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
+        }
+
         static auto compiled_decode_step = mx::compile(
             [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
                 auto q = inputs[0]; auto k = inputs[1]; auto v = inputs[2];

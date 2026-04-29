@@ -1,0 +1,8 @@
+model	prompt_hash	prompt_tokens	max_tokens	run	decode_tokens	prompt_tok_s	decode_tok_s	prompt_s	decode_s	unique_token_ratio	max_token_freq	max_token_run	output_hash	status	preview	token_hash
+[bench-output run=1]     return x + y
+
+def main():
+    print("Addition")
+    print(add(5, 3))
+    print(add(3
+mlx-community/Qwen3.5-0.8B-MLX-4bit	2b28c8c6f9cb8944	23	32	1	32	341.63	106.13	0.07	0.30	0.69	0.12	1	4c6f28ad68cb9baf	ok	    return x + y\n\ndef main():\n    print("Addition")\n    print(add(5, 3))\n    print(add(3	258b0c999903c82f

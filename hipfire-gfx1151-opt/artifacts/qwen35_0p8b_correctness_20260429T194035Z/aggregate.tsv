@@ -1,0 +1,4 @@
+case	model	quant_mode	runs	ok_runs	median_decode_tok_s	avg_decode_tokens	distinct_output_hashes	distinct_token_hashes
+qwen35_0p8b_bf16	Qwen/Qwen3.5-0.8B	default	1	1	29.0429	32.00	1	1
+qwen35_0p8b_4bit_dequantized	mlx-community/Qwen3.5-0.8B-MLX-4bit	dequantized	1	1	95.63	32.00	1	1
+qwen35_0p8b_4bit_native	mlx-community/Qwen3.5-0.8B-MLX-4bit	native_quantized	1	1	124.22	32.00	1	1
