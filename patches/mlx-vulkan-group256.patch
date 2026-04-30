@@ -1,0 +1,17 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index defcc2f6..39932b49 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4735,10 +4735,10 @@ array pack_and_quantize(
+ std::vector<array>
+ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
+   auto s = to_stream(s_);
+-  if (group_size != 32 && group_size != 64 && group_size != 128) {
++  if (group_size != 32 && group_size != 64 && group_size != 128 && group_size != 256) {
+     std::ostringstream msg;
+     msg << "[quantize] The requested group size " << group_size
+-        << " is not supported. The supported group sizes are 32, 64, and 128.";
++        << " is not supported. The supported group sizes are 32, 64, 128, and 256.";
+     throw std::invalid_argument(msg.str());
+   }
+ 
