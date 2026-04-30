@@ -5,11 +5,13 @@
 Tested QMV optimization options for lemon-mlx-engine on gfx1151. Profiled both lemon-mlx-engine and hipfire to identify bottlenecks. Found that `MLX_ROCM_QMV_COLS_PER_BLOCK=64` provides a ~2% improvement, but the fundamental gap is due to group_size difference (64 vs 256).
 
 **Update (2026-04-30):**
-- Added MLX C++ kernel support for group_size=256 (manual patch to qmm.hip)
-- Added MLX Python support for group_size=256 (mlx-vulkan patch)
-- Created quantization script to convert models to group_size=256
-- **Status**: Kernel changes complete, quantization script produces structurally correct models
-- **Issue**: Quantized models produce incorrect output due to weight source mismatch
+- MLX C++ kernel support for group_size=256: **COMPLETE**
+- MLX Python support for group_size=256: **COMPLETE**
+- Quantization scripts: **COMPLETE**
+- CPU validation tests: **PASSED**
+- **Blocker**: Weight source mismatch prevents end-to-end validation
+
+**See GROUP256_SUMMARY.md for complete details.**
 
 ## Benchmark Results
 
