@@ -195,11 +195,11 @@ def quantize_model_group256():
 
     print(f"\nSaved {len(new_header)} tensors to {output_file}")
 
-    # Copy and update config
-    ref_config = source_path / "config.json"
+    # Copy and update config - use MLX-community config as base
+    mlx_community_config = Path("/home/reckon/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-MLX-4bit/snapshots/main/config.json")
     new_config = output_path / "config.json"
 
-    with open(ref_config) as f:
+    with open(mlx_community_config) as f:
         config = json.load(f)
 
     # Update quantization
@@ -209,11 +209,14 @@ def quantize_model_group256():
     with open(new_config, 'w') as f:
         json.dump(config, f, indent=2)
 
-    # Copy other files
+    # Copy other files from MLX-community (tokenizer, etc.)
     import shutil
-    for f in ['tokenizer.json', 'tokenizer_config.json', 'generation_config.json', 'merges.txt', 'vocab.json']:
-        if (source_path / f).exists():
-            shutil.copy(source_path / f, output_path / f)
+    mlx_community_path = Path("/home/reckon/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-MLX-4bit/snapshots/main")
+    for f_name in ['tokenizer.json', 'tokenizer_config.json', 'generation_config.json',
+                    'special_tokens_map.json', 'vocab.json', 'merges.txt']:
+        src = mlx_community_path / f_name
+        if src.exists():
+            shutil.copy(src, output_path / f_name)
 
     print(f"Model saved to {output_path}")
     print(f"  - model.safetensors ({len(new_header)} tensors)")
