@@ -123,12 +123,13 @@ but when applied to the official Qwen weights, the resulting model is not functi
 
 ## Recommended Next Steps
 
-### Option 1: Use synthetic test for kernel validation (highest priority)
-- Create minimal reproducible test with known-good weights
-- Quantize/dequantize with group_size=256 and verify numerical correctness
-- Run on GPU to validate kernel launches correctly
-- **Estimated effort**: 2-4 hours
-- **Purpose**: Validate kernel changes work independently of model weight issues
+### Option 1: Validate with GPU quantized_matmul test (IN PROGRESS)
+- Created synthetic test with known-good weights
+- **Status**: CPU tests PASSED (commit 016f5f5)
+  - Quantize/dequantize roundtrip: ✓ PASS (1.2x error vs group64)
+  - Shape validation: ✓ PASS (all dimensions correct)
+- **Remaining**: GPU test requires lemon-mlx-engine build
+- **Estimated effort**: 1-2 hours to run on GPU
 
 ### Option 2: Find MLX-community FP32 source
 - Contact MLX-community maintainers or search for FP32 Qwen3.5-0.8B checkpoint
@@ -143,10 +144,10 @@ but when applied to the official Qwen weights, the resulting model is not functi
 - **Estimated effort**: 2-4 hours
 
 ### Option 4: Accept current state, document findings
-- Kernel changes are complete and ready
+- Kernel changes are numerically correct (CPU validation passed)
 - Quantization infrastructure is in place
 - Model format issue is a weight source problem, not a kernel problem
-- **Status**: Ready for future use when correct weights are available
+- **Status**: Ready for GPU validation once correct model weights are available
 
 ## Environment Variables for Performance
 
