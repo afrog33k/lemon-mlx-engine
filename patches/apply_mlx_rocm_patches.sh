@@ -17,3 +17,6 @@ done
 # Apply group_size=256 support directly (more reliable than patch file)
 # This adds gs256 type alias, case 256 to switch, and tiled path support
 python3 "$root_dir/patches/apply_qmv_group256.py" "$root_dir"
+
+# Apply Rdna35 TILE_N=8 optimization (validated on Strix Halo)
+python3 "$root_dir/patches/apply_rdna35_tile_n.py" "$root_dir"
