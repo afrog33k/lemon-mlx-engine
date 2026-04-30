@@ -33,16 +33,31 @@
 
 ## Current Blocker
 
-### Weight Source Mismatch
+### BF16 Format Complexity
 
-The MLX-community quantized model was created from **different weights** than the official Qwen model:
+**Latest Finding (2026-04-30):**
 
-| Model | Weight Range | Scales Range | Source |
-|-------|-------------|--------------|--------|
-| MLX-community (gs=64) | [-15, 15] | ~1.0 | Unknown/Modified checkpoint |
-| Official Qwen (FP32) | [-0.13, 0.18] | ~0.01 | Qwen/Qwen3.5-0.8B |
+The MLX-community model uses BF16 (bfloat16) format for storing scales/biases. When:
+- Read as float16 (incorrect): Values appear as ~1.0
+- Read by MLX correctly: Values are ~0.01 (matching official Qwen!)
 
-When quantizing the official Qwen weights to group_size=256, the resulting model loads successfully but produces incorrect output.
+This suggests the MLX-community model **may actually use the same weights as official Qwen**, but the BF16 format makes conversion complex.
+
+The dequantize/requantize approach (`scripts/dequantize_requantize_mlx.py`) successfully:
+1. Loads MLX-community model using MLX's `load` function (handles BF16 correctly)
+2. Dequantizes to FP32 with group_size=64
+3. Re-quantizes with group_size=256
+
+However, converting back to safetensors format with correct BF16 encoding remains challenging due to format differences between MLX's internal representation and the safetensors specification.
+
+### Technical Details
+
+The issue involves multiple format conversions:
+- Safetensors BF16 (2-byte, 8-bit exponent, 7-bit mantissa)
+- NumPy float16 (2-byte, 5-bit exponent, 10-bit mantissa)
+- MLX float32 (4-byte, standard floating point)
+
+When read incorrectly (BF16 as float16), values appear completely different.
 
 ### Evidence
 
