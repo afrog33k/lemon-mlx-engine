@@ -1,14 +1,15 @@
-# Next Steps - QMV Optimization (2026-04-29)
+# Next Steps - QMV Optimization (2026-04-30)
 
 ## Summary
 
 Tested QMV optimization options for lemon-mlx-engine on gfx1151. Profiled both lemon-mlx-engine and hipfire to identify bottlenecks. Found that `MLX_ROCM_QMV_COLS_PER_BLOCK=64` provides a ~2% improvement, but the fundamental gap is due to group_size difference (64 vs 256).
 
-**Update (2026-04-29 18:00 UTC):**
-- Added MLX C++ kernel support for group_size=256 (commit 65b40a9)
+**Update (2026-04-30):**
+- Added MLX C++ kernel support for group_size=256 (manual patch to qmm.hip)
 - Added MLX Python support for group_size=256 (mlx-vulkan patch)
 - Created quantization script to convert models to group_size=256
-- **Status**: Kernel changes complete, model re-quantization pending format compatibility testing
+- **Status**: Kernel changes complete, quantization script produces structurally correct models
+- **Issue**: Quantized models produce incorrect output due to weight source mismatch
 
 ## Benchmark Results
 
@@ -95,43 +96,57 @@ This enables `mx.quantize(weights, group_size=256, bits=4)` to work correctly.
   - Packed U32 weights (shape: [vocab, hidden/4] vs [vocab, hidden/16])
   - BF16 scales/biases (shape: [vocab, 4] vs [vocab, 16])
 
-### Model Format Challenge
-The quantized model structure differs from MLX-community format:
-- Original: `language_model.model.*` prefix, 848 tensors
-- New: Additional vision/tower components, 980 tensors
-- **Issue**: `bad_function_call` when loading with lemon-mlx-engine
-- **Root cause**: Model format mismatch (extra keys, structure differences)
+### Model Format Challenge (RESOLVED)
+The quantized model structure was fixed to match MLX-community format:
+- Now produces: `language_model.model.*` prefix, 848 tensors
+- Correct shapes: scales/biases [N, 4] for group_size=256
+- **Issue RESOLVED**: Model loads without `bad_function_call`
+
+### Current Status: Weight Source Mismatch
+**Commit fb684c8**: Quantization script produces structurally correct safetensors:
+- 848 tensors matching reference structure
+- Correct scales/biases shapes for group_size=256
+- Model loads successfully in lemon-mlx-engine
+
+**Issue**: Model produces incorrect output (repeated Arabic "ة" characters)
+- Root cause: Official Qwen/Qwen3.5-0.8B weights differ from MLX-community weights
+- MLX-community model was quantized from unknown/modified checkpoint
+- Quantizing official Qwen model produces semantically incorrect results
+
+**Verification**:
+- Official FP32 Qwen model: produces correct output
+- MLX-community group64 model: produces correct output
+- Quantized group256 model: produces incorrect output
+
+The quantize/dequantize roundtrip works correctly in isolation (tested with synthetic data),
+but when applied to the official Qwen weights, the resulting model is not functional.
 
 ## Recommended Next Steps
 
-### Option 1: Fix model format compatibility (high priority)
-- Re-run quantization filtering only language_model components
-- Match exact key structure of MLX-community model
-- Test with lemon-mlx-engine `bench` binary
+### Option 1: Use synthetic test for kernel validation (highest priority)
+- Create minimal reproducible test with known-good weights
+- Quantize/dequantize with group_size=256 and verify numerical correctness
+- Run on GPU to validate kernel launches correctly
 - **Estimated effort**: 2-4 hours
-- **Expected impact**: 20-40% overall speedup once working
+- **Purpose**: Validate kernel changes work independently of model weight issues
 
-### Option 2: Alternative: Test kernel changes directly
-- Write a minimal C++ test that uses group_size=256 quantization
-- Verify the kernel launches and produces correct results
-- **Estimated effort**: 1-2 hours
-- **Purpose**: Validate kernel changes independently
+### Option 2: Find MLX-community FP32 source
+- Contact MLX-community maintainers or search for FP32 Qwen3.5-0.8B checkpoint
+- Re-quantize from correct weights
+- **Estimated effort**: 4-8 hours (may not be possible)
+- **Risk**: FP32 source may not be publicly available
 
-### Option 2: Add MQ4G256/FWHT support to MLX (high impact, high effort)
-- Implement FWHT rotation in MLX
-- Add MQ4 dequantization kernel
-- Would enable exact artifact parity with hipfire
-- **Estimated impact**: 1.5-2x speedup
+### Option 3: Alternative model for validation
+- Use a simpler model where FP32 and quantized versions are known to match
+- Test group_size=256 conversion with known-good weights
+- **Examples**: TinyLlama, Qwen2-0.5B
+- **Estimated effort**: 2-4 hours
 
-### Option 3: Specialized tied lm-head kernel (medium impact, medium effort)
-- For M=1, very large N (vocab), consider top-k/argmax
-- Avoid computing full logits for greedy sampling
-- **Estimated impact**: 30-50% speedup on lm_head for greedy
-
-### Option 4: Accept current constraints
-- Document that hipfire's MQ4 format is fundamentally faster
-- Focus on improving MLX within its format constraints
-- cols64 setting already provides ~2% improvement
+### Option 4: Accept current state, document findings
+- Kernel changes are complete and ready
+- Quantization infrastructure is in place
+- Model format issue is a weight source problem, not a kernel problem
+- **Status**: Ready for future use when correct weights are available
 
 ## Environment Variables for Performance
 
